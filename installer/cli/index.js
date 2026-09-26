@@ -65,10 +65,10 @@ const PRODUCT_DIRS = process.platform === 'win32'
   ];
 
 /** Path inside the asar where the main-process entry lives (ESM). */
-const ASAR_MAIN_ENTRY = 'src-electron/dist/main/index.js';
+const ASAR_MAIN_ENTRY = 'dist/main/index.js';
 
 /** Path inside the asar where the preload entry lives (also unpacked to disk). */
-const ASAR_PRELOAD_ENTRY = 'src-electron/dist/preload/index.js';
+const ASAR_PRELOAD_ENTRY = 'dist/preload/index.cjs';
 
 // ---------------------------------------------------------------------------
 // Helpers

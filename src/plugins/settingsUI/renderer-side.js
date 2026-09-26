@@ -68,11 +68,26 @@
   function uid() { return '_' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
 
   // ─── Class discovery ──────────────────────────────────────────────────────
+  const SETTINGS_CONTENT_SELECTOR = '[data-flx="app.settings-modal-layout.settings-modal-desktop-content-component.desktop-content"]';
+
+  function findSettingsContent() {
+    const sidebar = findDeveloperSection();
+    if (!sidebar) return null;
+
+    // Keep the lookup inside the settings modal that owns the sidebar. A bare
+    // role="tabpanel" also matches unrelated app panels such as Friends.
+    let ancestor = sidebar.parentElement;
+    while (ancestor) {
+      const content = ancestor.querySelector(SETTINGS_CONTENT_SELECTOR);
+      if (content) return content;
+      ancestor = ancestor.parentElement;
+    }
+
+    return document.querySelector(SETTINGS_CONTENT_SELECTOR);
+  }
+
   function discoverClasses() {
-    const panel = document.querySelector(
-      '[data-flx="app.settings-modal-layout.settings-modal-desktop-content-component.desktop-content"], ' +
-      '[role="region"][class*="desktopContent"], [role="tabpanel"]',
-    );
+    const panel = findSettingsContent();
     if (!panel) return null;
 
     function pickAll(el) { return el ? Array.from(el.classList).join(' ') : ''; }
@@ -88,6 +103,7 @@
     const card       = pad?.querySelector('div');
     const header     = first('[data-flx="app.settings-modal-header.header"]', '[class*="desktopHeader"]');
     const titleCont  = first('[data-flx="app.settings-modal-header.title-content"]', '[class*="titleContent"]');
+    const closeBtn   = first('[data-flx="app.settings-modal-header.button.close"]', '[aria-label="Close"]');
     const h1         = panel.querySelector('h1');
     const scrollWrap = panel.querySelector('[class*="scrollerWrap"]');
     const scroller   = first('[data-settings-scroll-container]', '[data-fluxer-scroll-container]');
@@ -95,7 +111,10 @@
     const spacerTop  = first('[data-flx="app.settings-modal-layout.settings-modal-desktop-scroll.desktop-scroll-spacer-top"]', '[class*="ScrollSpacerTop"]');
     const scrollInner= first('[data-flx="app.settings-modal-layout.settings-modal-desktop-scroll.desktop-scroll-inner"]', '[class*="desktopScrollInner"]');
     const spacerBot  = first('[data-flx="app.settings-modal-layout.settings-modal-desktop-scroll.desktop-scroll-spacer-bottom"]', '[class*="ScrollSpacerBottom"]');
-    const tabCont    = scrollInner?.firstElementChild;
+    const tabCont    = first(
+      '[data-flx="app.settings-tab-layout.settings-tab-container.container"]',
+      '[class*="SettingsTabLayout"][class*="container"]',
+    ) || Array.from(scrollInner?.children ?? []).find(child => child.tagName !== 'OUTPUT');
     const subsec     = first('[data-flx="app.settings-section.section"]', '[class*="subsection"]');
     const subsecHdr  = subsec?.querySelector('[data-flx="app.settings-section.section-header"], [class*="subsectionHeader"]');
     const subsecTitle= subsecHdr?.querySelector('[data-flx="app.settings-section.section-title"], h3, h4');
@@ -110,6 +129,8 @@
       desktopContentCard:pickAll(card),
       desktopHeader:     pickAll(header),
       titleContent:      pickAll(titleCont),
+      closeButton:       pickAll(closeBtn),
+      closeIcon:         pickAll(closeBtn?.querySelector('svg')),
       title:             pickAll(h1),
       scrollerWrap:      pickAll(scrollWrap),
       scroller:          pickAll(scroller),
@@ -373,6 +394,9 @@
             <div class="${c.titleContent}" style="opacity:1;">
               <h1 class="${c.title}">Plugins</h1>
             </div>
+            <button type="button" class="${c.closeButton}" aria-label="Close" data-flx="app.settings-modal-header.button.close">
+              <svg class="${c.closeIcon}" fill="currentColor" viewBox="0 0 256 256" aria-hidden="true"><path d="M208.49,191.51a12,12,0,0,1-17,17L128,145,64.49,208.49a12,12,0,0,1-17-17L111,128,47.51,64.49a12,12,0,0,1,17-17L128,111l63.51-63.52a12,12,0,0,1,17,17L145,128Z"></path></svg>
+            </button>
           </div>
           <div role="group" class="${c.scrollerWrap}">
             <div class="${c.scroller}" dir="ltr" data-fluxer-scroll-container="true" data-settings-scroll-container="true" style="overflow:hidden auto;">
@@ -529,16 +553,22 @@
     }
     Object.assign(c, sc);
 
-    _realPanel = document.querySelector(
-      '[data-flx="app.settings-modal-layout.settings-modal-desktop-content-component.desktop-content"], ' +
-      '[role="region"][class*="desktopContent"], [role="tabpanel"]',
-    );
+    _realPanel = findSettingsContent();
     if (!_realPanel) return;
 
     // Remove any stale panel from a previous open
     document.getElementById('reflux-tabpanel-plugins')?.remove();
 
     _ourPanel = await buildPluginsPage(c);
+
+    const nativeClose = _realPanel.querySelector('[data-flx="app.settings-modal-header.button.close"]');
+    const replacementClose = _ourPanel.querySelector('[data-flx="app.settings-modal-header.button.close"]');
+    replacementClose?.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      hideRefluxPanel();
+      nativeClose?.click();
+    });
 
     _realPanel.insertAdjacentElement('afterend', _ourPanel);
     _realPanel.style.display = 'none';
@@ -629,7 +659,9 @@
     ].join(';');
     btn.appendChild(verSpan);
 
-    btn.addEventListener('click', async () => {
+    btn.addEventListener('click', async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
       btn.setAttribute('aria-selected', 'true');
       btn.setAttribute('tabindex', '0');
       await showRefluxPanel(sc);
