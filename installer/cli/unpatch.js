@@ -23,16 +23,26 @@ const _BASE = process.pkg ? path.dirname(process.execPath) : path.resolve(__dirn
 const REFLUX_ROOT    = path.resolve(_BASE, '..');
 const REFLUX_PRELOAD = path.join(REFLUX_ROOT, 'src', 'preload.js');
 
-const LOCALAPPDATA = process.env.LOCALAPPDATA || path.join(process.env.USERPROFILE || 'C:\\Users\\Default', 'AppData', 'Local');
+const home = process.env.HOME || process.env.USERPROFILE || require('os').homedir();
+const localAppData = process.env.LOCALAPPDATA || path.join(process.env.USERPROFILE || 'C:\\Users\\Default', 'AppData', 'Local');
+const dataHome = process.env.XDG_DATA_HOME || path.join(home, '.local', 'share');
 
-const PRODUCT_DIRS = [
-  path.join(LOCALAPPDATA, 'fluxer_app'),         // standard install (confirmed)
-  path.join(LOCALAPPDATA, 'fluxer_app_canary'),  // canary variant (assumed)
-  path.join(LOCALAPPDATA, 'Fluxer'),             // legacy / alternative name
-  path.join(LOCALAPPDATA, 'Fluxer Canary'),
-  path.join('C:\\', 'Program Files', 'Fluxer', 'resources'),
-  path.join('C:\\', 'Program Files (x86)', 'Fluxer', 'resources'),
-];
+const PRODUCT_DIRS = process.platform === 'win32'
+  ? [
+    path.join(localAppData, 'fluxer_app'),
+    path.join(localAppData, 'fluxer_app_canary'),
+    path.join(localAppData, 'Fluxer'),
+    path.join(localAppData, 'Fluxer Canary'),
+    path.join('C:\\', 'Program Files', 'Fluxer', 'resources'),
+    path.join('C:\\', 'Program Files (x86)', 'Fluxer', 'resources'),
+  ]
+  : [
+    path.join(dataHome, 'Fluxer'),
+    path.join(dataHome, 'fluxer'),
+    path.join(dataHome, 'fluxer_app'),
+    path.join(home, '.config', 'Fluxer'),
+    path.join(home, '.config', 'fluxer'),
+  ];
 
 const ASAR_PRELOAD_ENTRY = 'src-electron/dist/preload/index.js';
 

@@ -63,6 +63,7 @@
 
   /** @type {ModulePatch[]} */
   const _modulePatches = [];
+  const REACT_COMPONENT_PATCH = Symbol('refluxReactComponentPatch');
 
   /** @type {Function|null}  Webpack's internal require function. */
   let _webpackRequire = null;
@@ -89,6 +90,62 @@
       }
     }
     return result;
+  }
+
+  /**
+   * Wrap a function component and transform its rendered element.
+   * Returning undefined from the callback preserves the original result.
+   * @param {Function} component
+   * @param {string} displayName
+   * @param {Function} callback
+   * @returns {Function}
+   */
+  function _wrapReactComponent(component, displayName, callback) {
+    if (typeof component !== 'function' || component[REACT_COMPONENT_PATCH]) return component;
+
+    const wrapped = function refluxPatchedComponent(props) {
+      const result = component(props);
+      const next = callback(result, props, component);
+      return next === undefined ? result : next;
+    };
+
+    try {
+      Object.defineProperty(wrapped, 'displayName', {
+        value: displayName || component.displayName || component.name,
+        configurable: true,
+      });
+      Object.defineProperty(wrapped, REACT_COMPONENT_PATCH, {value: true});
+    } catch { /* function metadata is non-essential */ }
+
+    // Preserve common React component statics such as defaultProps and $$typeof.
+    for (const key of [...Object.getOwnPropertyNames(component), ...Object.getOwnPropertySymbols(component)]) {
+      if (key === 'name' || key === 'length' || key === 'prototype' || key === 'displayName') continue;
+      try {
+        Object.defineProperty(wrapped, key, Object.getOwnPropertyDescriptor(component, key));
+      } catch { /* some function properties are read-only */ }
+    }
+    return wrapped;
+  }
+
+  function _patchReactExports(exports, displayName, callback, changes) {
+    const matches = [];
+    const isMatch = (value) => value && (value.displayName === displayName || value.name === displayName);
+
+    if (isMatch(exports)) matches.push({owner: null, key: null, component: exports});
+    if (exports && typeof exports === 'object') {
+      for (const key of Object.keys(exports)) {
+        if (isMatch(exports[key])) matches.push({owner: exports, key, component: exports[key]});
+      }
+    }
+
+    for (const match of matches) {
+      const wrapped = _wrapReactComponent(match.component, displayName, callback);
+      if (wrapped === match.component) continue;
+      if (match.owner) match.owner[match.key] = wrapped;
+      else exports = wrapped;
+      changes.push({...match, wrapped});
+    }
+    return exports;
   }
 
   /**
@@ -289,6 +346,58 @@
         },
         callback
       );
+    },
+
+    /**
+     * Wrap function React components matching `displayName` and transform
+     * their rendered element. Callback receives `(result, props, original)`.
+     * Returning undefined keeps the original rendered element.
+     *
+     * @param {string} displayName
+     * @param {(result: any, props: any, original: Function) => any} callback
+     * @returns {() => void} Unregister function.
+     */
+    patchReactComponent(displayName, callback) {
+      const moduleChanges = new Map();
+      const matchesReactComponent = (exports) => {
+        const isMatch = (value) => value && (value.displayName === displayName || value.name === displayName);
+        return isMatch(exports) || (exports && typeof exports === 'object' && Object.values(exports).some(isMatch));
+      };
+      const unpatchModule = this.patch(
+        matchesReactComponent,
+        (exports, id) => {
+          const changes = [];
+          const patched = _patchReactExports(exports, displayName, callback, changes);
+          if (changes.length) moduleChanges.set(id, changes);
+          return patched;
+        },
+      );
+
+      // Renderer plugins usually load after Fluxer has already initialized.
+      if (_webpackRequire?.c) {
+        for (const [id, module] of Object.entries(_webpackRequire.c)) {
+          if (module?.exports && matchesReactComponent(module.exports)) {
+            const changes = [];
+            _patchReactExports(module.exports, displayName, callback, changes);
+            if (changes.length) moduleChanges.set(id, changes);
+          }
+        }
+      }
+
+      return () => {
+        unpatchModule();
+        for (const [id, changes] of moduleChanges) {
+          for (const change of changes) {
+            if (change.owner) {
+              if (change.owner[change.key] === change.wrapped) change.owner[change.key] = change.component;
+            } else {
+              const module = _webpackRequire?.c?.[id];
+              if (module?.exports === change.wrapped) module.exports = change.component;
+            }
+          }
+        }
+        moduleChanges.clear();
+      };
     },
 
     /**

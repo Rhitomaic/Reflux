@@ -1,7 +1,7 @@
 /**
  * installer/index.js
  *
- * Locates Fluxer's installed resources on Windows and injects Reflux by:
+ * Locates Fluxer's installed resources and injects Reflux by:
  *
  *   1. Backing up the original app.asar as app.asar.bak (idempotent).
  *   2. Injecting into the already-unpacked preload script
@@ -11,9 +11,11 @@
  *      app.asar so that Reflux's main-side code (CSP stripping, content script
  *      injection) runs before any Fluxer windows are created.
  *
- * Fluxer uses the Squirrel Windows installer, so the install path is:
+ * On Windows, Fluxer uses the Squirrel installer, so the install path is:
  *   %LOCALAPPDATA%\Fluxer\app-<version>\resources\
  *   %LOCALAPPDATA%\Fluxer Canary\app-<version>\resources\   (canary builds)
+ * On Linux, use FLUXER_ASAR when Fluxer is installed in a custom location;
+ * common native package and unpacked-app locations are also searched.
  *
  * Run with: node installer/index.js
  * Override asar path: FLUXER_ASAR=C:\...\app.asar node installer/index.js
@@ -41,17 +43,26 @@ const REFLUX_PRELOAD = path.join(REFLUX_ROOT, 'src', 'preload.js');
  * Squirrel installs Fluxer into versioned subdirectories under %LOCALAPPDATA%.
  * We search inside each product name's folder for the latest app-<version>.
  */
-const LOCALAPPDATA = process.env.LOCALAPPDATA || path.join(process.env.USERPROFILE || 'C:\\Users\\Default', 'AppData', 'Local');
+const home = process.env.HOME || process.env.USERPROFILE || require('os').homedir();
+const localAppData = process.env.LOCALAPPDATA || path.join(process.env.USERPROFILE || 'C:\\Users\\Default', 'AppData', 'Local');
+const dataHome = process.env.XDG_DATA_HOME || path.join(home, '.local', 'share');
 
-const PRODUCT_DIRS = [
-  path.join(LOCALAPPDATA, 'fluxer_app'),         // standard install (confirmed)
-  path.join(LOCALAPPDATA, 'fluxer_app_canary'),  // canary variant (assumed)
-  path.join(LOCALAPPDATA, 'Fluxer'),             // legacy / alternative name
-  path.join(LOCALAPPDATA, 'Fluxer Canary'),
-  // Traditional installers:
-  path.join('C:\\', 'Program Files', 'Fluxer', 'resources'),
-  path.join('C:\\', 'Program Files (x86)', 'Fluxer', 'resources'),
-];
+const PRODUCT_DIRS = process.platform === 'win32'
+  ? [
+    path.join(localAppData, 'fluxer_app'),
+    path.join(localAppData, 'fluxer_app_canary'),
+    path.join(localAppData, 'Fluxer'),
+    path.join(localAppData, 'Fluxer Canary'),
+    path.join('C:\\', 'Program Files', 'Fluxer', 'resources'),
+    path.join('C:\\', 'Program Files (x86)', 'Fluxer', 'resources'),
+  ]
+  : [
+    path.join(dataHome, 'Fluxer'),
+    path.join(dataHome, 'fluxer'),
+    path.join(dataHome, 'fluxer_app'),
+    path.join(home, '.config', 'Fluxer'),
+    path.join(home, '.config', 'fluxer'),
+  ];
 
 /** Path inside the asar where the main-process entry lives (ESM). */
 const ASAR_MAIN_ENTRY = 'src-electron/dist/main/index.js';

@@ -32,8 +32,9 @@
  *
  * 1. patchByExportKey(key, cb)        — module has a specific export name
  * 2. patchByDisplayName(name, cb)     — React component with displayName
- * 3. patch(filter, cb)                — arbitrary filter on exports object
- * 4. findModules(filter)              — search already-loaded module cache
+ * 3. patchReactComponent(name, cb)    — transform a function component render
+ * 4. patch(filter, cb)                — arbitrary filter on exports object
+ * 5. findModules(filter)              — search already-loaded module cache
  *
  * All four are available on window.__reflux.patcher after renderer.js runs.
  *
@@ -76,7 +77,10 @@ function patchByExportKey(key, callback)      { return getPatcher().patchByExpor
 /** @see {import('../renderer').Patcher.patchByDisplayName} */
 function patchByDisplayName(name, callback)   { return getPatcher().patchByDisplayName(name, callback); }
 
+/** @see {import('../renderer').Patcher.patchReactComponent} */
+function patchReactComponent(name, callback)  { return getPatcher().patchReactComponent(name, callback); }
+
 /** @see {import('../renderer').Patcher.findModules} */
 function findModules(filter)                  { return getPatcher().findModules(filter); }
 
-module.exports = { patch, patchByExportKey, patchByDisplayName, findModules, getPatcher };
+module.exports = { patch, patchByExportKey, patchByDisplayName, patchReactComponent, findModules, getPatcher };

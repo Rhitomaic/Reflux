@@ -4,6 +4,7 @@
 
 <p align="center">
   Reflux is a Vencord-style runtime injector for the Fluxer desktop app.
+  Original dev vibe coded this, still trying to navigate this mess to make it work with newer Fluxcord versions
 </p>
 
 <h3 align="center">
@@ -19,7 +20,7 @@
 - Gateway WebSocket interception (`wss://gateway.fluxer.app`) for event hooks
 - Injected **Reflux** section inside Fluxer's native settings panel
 - Import custom `.js` plugins at runtime with `==RefluxPlugin==` metadata blocks
-- Settings persisted to `%APPDATA%\Reflux\settings.json`
+- Settings persisted to `%APPDATA%\Reflux\settings.json` on Windows or `~/AppData/Roaming/Reflux/settings.json` on Linux
 
 <h2 align="center">Bundled plugins</h2>
 
@@ -30,24 +31,63 @@
 
 <h2 align="center">Install</h2>
 
+Install dependencies from the repository root:
+
 ```bash
 cd installer
 npm install
-node index.js
 ```
 
-Reflux auto-detects the latest Fluxer version under `%LOCALAPPDATA%\fluxer_app\`.
+Run the installer CLI:
+
+```bash
+node cli/index.js
+```
+
+On Windows, Reflux searches the Fluxer installation under `%LOCALAPPDATA%`.
+On Linux, it searches common locations under `~/.local/share` and `~/.config`.
+You can always provide the exact Fluxer archive path with `FLUXER_ASAR`:
 
 Override the target manually:
 
 ```bash
-FLUXER_ASAR=C:\Users\<USERNAME>\AppData\Local\fluxer_app\app-0.0.8\resources\app.asar node installer/index.js
+FLUXER_ASAR=/path/to/Fluxer/resources/app.asar node installer/cli/index.js
 ```
+
+For Windows, the equivalent is:
+
+```powershell
+$env:FLUXER_ASAR = "C:\Users\<USERNAME>\AppData\Local\fluxer_app\app-0.0.8\resources\app.asar"
+node installer\cli\index.js
+```
+
+### Building Linux artifacts
+
+The build detects the current operating system automatically:
+
+```bash
+node installer/build.js
+```
+
+On Linux this produces:
+
+- `installer/dist/reflux-v<version>-linux-x64-setup.AppImage` — GUI installer
+- `installer/dist/reflux-v<version>-linux-x64-cli` — executable launcher using the system `node`
+
+The Linux CLI intentionally does not bundle or compile Node.js. Install Node.js
+from Arch's repositories first if needed:
+
+```bash
+sudo pacman -S nodejs npm
+```
+
+On Windows, the same build command produces a portable GUI `.exe` and a
+standalone CLI `.exe`.
 
 <h2 align="center">Uninstall</h2>
 
 ```bash
-node installer/unpatch.js
+node installer/cli/unpatch.js
 ```
 
 Restores `app.asar` from `app.asar.bak` and removes all injected lines from the unpacked preload.
@@ -108,10 +148,14 @@ src/
   - backup: `app.asar.bak`
 - `resources/app.asar.unpacked/src-electron/dist/preload/index.js` — no longer patched directly; Reflux preload is registered via `session.setPreloads()` instead
 
-Settings are stored at `%APPDATA%\Reflux\settings.json`.
+Settings are stored at `%APPDATA%\Reflux\settings.json` on Windows. On Linux,
+the current settings implementation uses `~/AppData/Roaming/Reflux/settings.json`.
 
 <h2 align="center">Default install path</h2>
 
 - Windows: `%LOCALAPPDATA%\fluxer_app\app-<version>\resources\`
 - Canary: `%LOCALAPPDATA%\Fluxer Canary\app-<version>\resources\`
+- Linux: `~/.local/share/Fluxer/` or `~/.local/share/fluxer/`
+- Linux alternatives: `~/.local/share/fluxer_app/`, `~/.config/Fluxer/`, `~/.config/fluxer/`
+- Custom installation: set `FLUXER_ASAR` to the full path of `resources/app.asar`
 

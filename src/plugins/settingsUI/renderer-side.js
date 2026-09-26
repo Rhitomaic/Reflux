@@ -69,30 +69,40 @@
 
   // ─── Class discovery ──────────────────────────────────────────────────────
   function discoverClasses() {
-    const panel = document.querySelector('[role="tabpanel"]');
+    const panel = document.querySelector(
+      '[data-flx="app.settings-modal-layout.settings-modal-desktop-content-component.desktop-content"], ' +
+      '[role="region"][class*="desktopContent"], [role="tabpanel"]',
+    );
     if (!panel) return null;
 
     function pickAll(el) { return el ? Array.from(el.classList).join(' ') : ''; }
+    function first(...selectors) {
+      for (const selector of selectors) {
+        const element = panel.querySelector(selector);
+        if (element) return element;
+      }
+      return null;
+    }
 
     const pad        = panel.querySelector('div');
     const card       = pad?.querySelector('div');
-    const header     = panel.querySelector('[class*="desktopHeader"]');
-    const titleCont  = panel.querySelector('[class*="titleContent"]');
+    const header     = first('[data-flx="app.settings-modal-header.header"]', '[class*="desktopHeader"]');
+    const titleCont  = first('[data-flx="app.settings-modal-header.title-content"]', '[class*="titleContent"]');
     const h1         = panel.querySelector('h1');
     const scrollWrap = panel.querySelector('[class*="scrollerWrap"]');
-    const scroller   = panel.querySelector('[data-settings-scroll-container]');
+    const scroller   = first('[data-settings-scroll-container]', '[data-fluxer-scroll-container]');
     const scrollCh   = scroller?.firstElementChild;
-    const spacerTop  = scrollCh?.querySelector('[class*="ScrollSpacerTop"]');
-    const scrollInner= scrollCh?.querySelector('[class*="desktopScrollInner"]');
-    const spacerBot  = scrollCh?.querySelector('[class*="ScrollSpacerBottom"]');
+    const spacerTop  = first('[data-flx="app.settings-modal-layout.settings-modal-desktop-scroll.desktop-scroll-spacer-top"]', '[class*="ScrollSpacerTop"]');
+    const scrollInner= first('[data-flx="app.settings-modal-layout.settings-modal-desktop-scroll.desktop-scroll-inner"]', '[class*="desktopScrollInner"]');
+    const spacerBot  = first('[data-flx="app.settings-modal-layout.settings-modal-desktop-scroll.desktop-scroll-spacer-bottom"]', '[class*="ScrollSpacerBottom"]');
     const tabCont    = scrollInner?.firstElementChild;
-    const subsec     = tabCont?.firstElementChild;
-    const subsecHdr  = subsec?.querySelector('[class*="subsectionHeader"]');
-    const subsecTitle= subsecHdr?.querySelector('h4');
-    const subsecDesc = subsecHdr?.querySelector('p');
-    const subsecCont = subsec?.querySelector('[class*="subsectionContent"]');
-    const trackEl    = panel.querySelector('[class*="ScrollerTrack"][class*="track"]');
-    const thumbEl    = trackEl?.querySelector('[class*="thumb"]');
+    const subsec     = first('[data-flx="app.settings-section.section"]', '[class*="subsection"]');
+    const subsecHdr  = subsec?.querySelector('[data-flx="app.settings-section.section-header"], [class*="subsectionHeader"]');
+    const subsecTitle= subsecHdr?.querySelector('[data-flx="app.settings-section.section-title"], h3, h4');
+    const subsecDesc = subsecHdr?.querySelector('[data-flx="app.settings-section.section-description"], p');
+    const subsecCont = subsec?.querySelector('[data-flx="app.settings-section.section-content"], [class*="subsectionContent"]');
+    const trackEl    = first('[data-flx="ui.scroller.scroller-track.presentation.track-pointer-down"]', '[class*="ScrollerTrack"][class*="track"]');
+    const thumbEl    = trackEl?.querySelector('[data-scroller-thumb="true"], [class*="thumb"]');
 
     return {
       desktopContent:    pickAll(panel),
@@ -147,11 +157,15 @@
     _styleTag.id = 'reflux-active-style';
     // Suppress highlight on all non-Reflux sidebar tabs
     _styleTag.textContent = `
+      [data-flx="app.settings-modal-layout.settings-modal-sidebar-category.sidebar-category"]:not(#reflux-sidebar-section) [role="treeitem"][aria-selected="true"],
+      [class*="sidebarCategory"]:not(#reflux-sidebar-section) [role="treeitem"][aria-selected="true"],
       [class*="sidebarCategory"]:not(#reflux-sidebar-section) [role="tab"][aria-selected="true"],
-      [class*="sidebarCategory"]:not(#reflux-sidebar-section) [role="tab"][data-selected="true"] {
+      [class*="sidebarCategory"]:not(#reflux-sidebar-section) [role="treeitem"][data-selected="true"] {
         background: transparent !important;
         color: var(--interactive-normal, #b9bbbe) !important;
       }
+      [data-flx="app.settings-modal-layout.settings-modal-sidebar-category.sidebar-category"]:not(#reflux-sidebar-section) [role="treeitem"][aria-selected="true"] > *,
+      [class*="sidebarCategory"]:not(#reflux-sidebar-section) [role="treeitem"][aria-selected="true"] > *,
       [class*="sidebarCategory"]:not(#reflux-sidebar-section) [role="tab"][aria-selected="true"] > * {
         opacity: 0.6 !important;
       }
@@ -330,11 +344,13 @@
 
     const hdr = document.createElement('div');
     hdr.className = c.subsectionHeader;
-    hdr.innerHTML = `<h4 class="${c.subsectionTitle}">${esc(title)}</h4>` +
+    hdr.dataset.flx = 'app.settings-section.section-header';
+    hdr.innerHTML = `<h3 class="${c.subsectionTitle}" data-flx="app.settings-section.section-title">${esc(title)}</h3>` +
       (description ? `<p class="${c.subsectionDesc}">${esc(description)}</p>` : '');
 
     const content = document.createElement('div');
     content.className = c.subsectionContent;
+    content.dataset.flx = 'app.settings-section.section-content';
 
     sec.appendChild(hdr);
     sec.appendChild(content);
@@ -345,7 +361,9 @@
   async function buildPluginsPage(c) {
     const page = document.createElement('div');
     page.className = c.desktopContent;
-    page.setAttribute('role', 'tabpanel');
+    page.setAttribute('role', 'region');
+    page.setAttribute('aria-labelledby', 'reflux-tab-plugins');
+    page.dataset.flx = 'app.settings-modal-layout.settings-modal-desktop-content-component.desktop-content';
     page.id = 'reflux-tabpanel-plugins';
 
     page.innerHTML = `
@@ -357,7 +375,7 @@
             </div>
           </div>
           <div role="group" class="${c.scrollerWrap}">
-            <div class="${c.scroller}" dir="ltr" data-settings-scroll-container="true" style="overflow:hidden auto;">
+            <div class="${c.scroller}" dir="ltr" data-fluxer-scroll-container="true" data-settings-scroll-container="true" style="overflow:hidden auto;">
               <div class="${c.scrollerChildren}">
                 <div class="${c.spacerTop}"></div>
                 <div class="${c.scrollInner}">
@@ -511,7 +529,10 @@
     }
     Object.assign(c, sc);
 
-    _realPanel = document.querySelector('[role="tabpanel"]');
+    _realPanel = document.querySelector(
+      '[data-flx="app.settings-modal-layout.settings-modal-desktop-content-component.desktop-content"], ' +
+      '[role="region"][class*="desktopContent"], [role="tabpanel"]',
+    );
     if (!_realPanel) return;
 
     // Remove any stale panel from a previous open
@@ -528,7 +549,7 @@
     // Restore when any native Fluxer tab is clicked
     if (_cleanupFn) _cleanupFn();
     const handler = (e) => {
-      const tab = e.target.closest('[role="tab"]');
+      const tab = e.target.closest('[role="treeitem"], [role="tab"]');
       if (tab && tab.id !== 'reflux-tab-plugins') hideRefluxPanel();
     };
     document.addEventListener('click', handler, true);
@@ -546,7 +567,10 @@
 
   // ─── Sidebar injection ────────────────────────────────────────────────────
   function findDeveloperSection() {
-    for (const s of document.querySelectorAll('[class*="sidebarCategory"]')) {
+    for (const s of document.querySelectorAll(
+      '[data-flx="app.settings-modal-layout.settings-modal-sidebar-category.sidebar-category"], ' +
+      '[class*="sidebarCategory"]',
+    )) {
       if (s.querySelector('h2')?.textContent.trim() === 'Developer') return s;
     }
     return null;
@@ -556,11 +580,13 @@
     const section = document.createElement('section');
     section.id = 'reflux-sidebar-section';
     section.className = sc.cat;
+    section.dataset.flx = 'app.settings-modal-layout.settings-modal-sidebar-category.sidebar-category';
     section.setAttribute('aria-labelledby', 'reflux-sidebar-heading');
 
     const h2 = document.createElement('h2');
     h2.id = 'reflux-sidebar-heading';
     h2.className = sc.catTitle;
+    h2.dataset.flx = 'app.settings-modal-layout.settings-modal-sidebar-category-title.sidebar-category-title';
     h2.textContent = 'Reflux';
     section.appendChild(h2);
 
@@ -568,9 +594,14 @@
     btn.id = 'reflux-tab-plugins';
     btn.type = 'button';
     btn.className = sc.item;
-    btn.setAttribute('role', 'tab');
+    btn.setAttribute('role', 'treeitem');
+    btn.setAttribute('data-settings-sidebar-item', 'true');
+    btn.setAttribute('data-settings-tab', 'true');
+    btn.setAttribute('aria-level', '1');
     btn.setAttribute('aria-selected', 'false');
     btn.setAttribute('tabindex', '-1');
+    btn.setAttribute('aria-controls', 'reflux-tabpanel-plugins');
+    btn.dataset.flx = 'app.settings-modal-layout.settings-modal-sidebar-item.button';
 
     const iconWrap = document.createElement('span');
     iconWrap.innerHTML = svgEl(SVG_PLUG);

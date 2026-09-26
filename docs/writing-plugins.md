@@ -125,6 +125,41 @@ module.exports = {
 
 > **Guard against double-injection** — always check a flag like `window.__myPlugin_loaded` at the top of your renderer script. Fluxer may reload pages without a full restart.
 
+## Patching React components
+
+Renderer plugins can wrap a function component by its `displayName`. The
+callback runs after the original component renders and receives the rendered
+element, props, and original component. Return a replacement element to change
+the output, or return `undefined` to leave it unchanged.
+
+```js
+(function myComponentPatch() {
+  const unpatch = window.__reflux.patcher.patchReactComponent(
+    'MessageContent',
+    (element, props) => {
+      if (!element || !props?.message) return;
+
+      // Return a React element created with Fluxer's React runtime here.
+      // Returning undefined keeps the original component output.
+      console.log('Message:', props.message.id);
+    },
+  );
+
+  window.__reflux.pluginManager.register({
+    name: 'myComponentPatch',
+    start() {},
+    stop() {
+      unpatch();
+    },
+  });
+})();
+```
+
+`patchReactComponent()` handles components that are already loaded as well as
+components loaded later. It currently targets function components; class,
+`memo`, and `forwardRef` wrappers need separate handling because they do not
+all have the same callable shape.
+
 ---
 
 ## Accessing settings from the renderer
