@@ -37,12 +37,19 @@
       "target": [
         {
           "target": "portable",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ]
     },
     "portable": {
       "artifactName": "reflux-v${version}-win-x64-setup.exe"
     }
+  },
+  "allowScripts": {
+    "electron@41.10.7": true,
+    "esbuild@0.28.2": true,
+    "electron-winstaller@5.4.0": true
   }
 }
