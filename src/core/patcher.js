@@ -14,7 +14,7 @@
  *
  * Usage (inside a renderer plugin):
  *
- *   const { patch, patchByExportKey, findModules } = window.__reflux.patcher;
+ *   const { patch, patchByExportKey, findByProps, findModules } = window.__reflux.patcher;
  *
  *   // Patch any module that exports a `sendMessage` function.
  *   const unpatch = patchByExportKey('sendMessage', (exports) => {
@@ -30,13 +30,17 @@
  *
  * ─── Patching strategies ─────────────────────────────────────────────────
  *
- * 1. patchByExportKey(key, cb)        — module has a specific export name
- * 2. patchByDisplayName(name, cb)     — React component with displayName
- * 3. patchReactComponent(name, cb)    — transform a function component render
- * 4. patch(filter, cb)                — arbitrary filter on exports object
- * 5. findModules(filter)              — search already-loaded module cache
+ * 1. findByProps(...props)            — loaded module with matching exports
+ * 2. findByName(name)                 — loaded function or React component
+ * 3. findByCode(...snippets)          — loaded module matching factory source
+ * 4. patchByExportKey(key, cb)        — module has a specific export name
+ * 5. patchByDisplayName(name, cb)     — React component with displayName
+ * 6. patchReactComponent(name, cb)    — transform a function component render
+ * 7. patch(filter, cb)                — arbitrary filter on exports object
+ * 8. before/after/instead(...)        — patch a method on a known object
+ * 9. findModules(filter)              — search already-loaded module cache
  *
- * All four are available on window.__reflux.patcher after renderer.js runs.
+ * These helpers are available on window.__reflux.patcher after renderer.js runs.
  *
  * ─────────────────────────────────────────────────────────────────────────
  *
@@ -74,6 +78,15 @@ function patch(filter, callback)              { return getPatcher().patch(filter
 /** @see {import('../renderer').Patcher.patchByExportKey} */
 function patchByExportKey(key, callback)      { return getPatcher().patchByExportKey(key, callback); }
 
+/** @see {import('../renderer').Patcher.findByProps} */
+function findByProps(...props)                { return getPatcher().findByProps(...props); }
+
+/** @see {import('../renderer').Patcher.findByName} */
+function findByName(name)                     { return getPatcher().findByName(name); }
+
+/** @see {import('../renderer').Patcher.findByCode} */
+function findByCode(...snippets)               { return getPatcher().findByCode(...snippets); }
+
 /** @see {import('../renderer').Patcher.patchByDisplayName} */
 function patchByDisplayName(name, callback)   { return getPatcher().patchByDisplayName(name, callback); }
 
@@ -83,4 +96,17 @@ function patchReactComponent(name, callback)  { return getPatcher().patchReactCo
 /** @see {import('../renderer').Patcher.findModules} */
 function findModules(filter)                  { return getPatcher().findModules(filter); }
 
-module.exports = { patch, patchByExportKey, patchByDisplayName, patchReactComponent, findModules, getPatcher };
+/** @see {import('../renderer').Patcher.before} */
+function before(target, method, callback)     { return getPatcher().before(target, method, callback); }
+
+/** @see {import('../renderer').Patcher.after} */
+function after(target, method, callback)      { return getPatcher().after(target, method, callback); }
+
+/** @see {import('../renderer').Patcher.instead} */
+function instead(target, method, callback)    { return getPatcher().instead(target, method, callback); }
+
+module.exports = {
+  patch, patchByExportKey, findByProps, findByName, findByCode,
+  patchByDisplayName, patchReactComponent, findModules,
+  before, after, instead, getPatcher,
+};

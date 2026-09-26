@@ -160,6 +160,93 @@ components loaded later. It currently targets function components; class,
 `memo`, and `forwardRef` wrappers need separate handling because they do not
 all have the same callable shape.
 
+## Finding modules and patching methods
+
+The patcher also provides small Vencord-style helpers for common webpack
+module tasks. These helpers search the modules that Fluxer has already loaded:
+
+```js
+const { findByProps, findByName, findByCode } = window.__reflux.patcher;
+
+// Find a module export with these properties.
+const messageStore = findByProps('getMessage', 'getMessages');
+
+// Find a function export by function name or React displayName.
+const MessageContent = findByName('MessageContent');
+
+// Find a loaded module whose webpack factory contains every snippet.
+const targetModule = findByCode('MESSAGE_CREATE', 'getChannel');
+```
+
+`findByCode()` searches webpack factory source and is therefore more fragile
+than property or name lookups. All three finders return `null` when there is no
+match. They do not force lazy modules to load.
+
+For patching methods on a module or object, use `before`, `after`, or `instead`.
+Each returns an unpatch function and should be cleaned up from the plugin's
+`stop()` method:
+
+```js
+const { findByProps, after, instead } = window.__reflux.patcher;
+const messageStore = findByProps('getMessage');
+
+const unpatchRead = after(messageStore, 'getMessage', (args, result) => {
+  console.log('Read message:', args[0]);
+  return result;
+});
+
+const unpatchSend = instead(messageStore, 'sendMessage', (args, original) => {
+  console.log('Sending:', args[0]);
+  return original(...args);
+});
+
+window.__reflux.pluginManager.register({
+  name: 'storePatch',
+  start() {},
+  stop() {
+    unpatchRead();
+    unpatchSend();
+  },
+});
+```
+
+`before` receives `(args)`, where changing the array changes the arguments
+passed to the original method. `after` receives `(args, result)` and can
+replace the result by returning a value. `instead` receives `(args, original)`;
+`original` is bound to the target object. These method helpers patch the
+specific object supplied to them; they do not search for methods themselves.
+
+## Existing UI and navigation helpers
+
+Use `window.__reflux.ui` when a plugin needs to work with Fluxer's existing
+controls and routes without depending on hashed CSS classes or private React
+internals:
+
+```js
+const {ui} = window.__reflux;
+
+// Wait for a lazy-loaded control, then use the existing UI behavior.
+const settingsButton = await ui.waitFor('[aria-label="Settings"]');
+ui.click(settingsButton);
+
+// Text and role lookups are useful when class names change between builds.
+const pluginsTab = ui.findByRole('tab', 'Plugins');
+ui.click(pluginsTab);
+
+// Navigate the SPA and receive future route changes.
+const stopRouting = ui.onNavigate((url) => {
+  if (url.pathname.startsWith('/channels/')) console.log('Channel route:', url.pathname);
+});
+ui.navigate('/channels/123/general');
+```
+
+Available helpers are `find`, `findAll`, `findByText`, `findByRole`, `waitFor`,
+`click`, `injectCSS`, `navigate`, and `onNavigate`. `waitFor()` resolves to
+the first matching element or `null` after its timeout. `injectCSS()` and
+`onNavigate()` return cleanup functions. `navigate()` uses the browser
+history API and dispatches `popstate`; it is intended for Fluxer routes that
+already respond to normal browser navigation.
+
 ---
 
 ## Accessing settings from the renderer

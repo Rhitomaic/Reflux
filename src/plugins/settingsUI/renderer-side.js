@@ -230,7 +230,23 @@
     catch (e) { console.error('[Reflux:SettingsUI] Plugin runtime error:', e); }
   }
 
-  getImported().then(list => list.filter(p => p.enabled !== false).forEach(p => runPlugin(p.source)));
+  const _importedRuntime = new Map();
+
+  function startImportedPlugin(plugin) {
+    const before = new Set(window.__reflux?.pluginManager?.list?.() ?? []);
+    runPlugin(plugin.source);
+    const after = window.__reflux?.pluginManager?.list?.() ?? [];
+    _importedRuntime.set(plugin.id, after.filter(name => !before.has(name)));
+  }
+
+  function stopImportedPlugin(id) {
+    for (const name of _importedRuntime.get(id) ?? []) {
+      window.__reflux?.pluginManager?.unregister?.(name);
+    }
+    _importedRuntime.delete(id);
+  }
+
+  getImported().then(list => list.filter(p => p.enabled !== false).forEach(startImportedPlugin));
 
   // ─── Plugin card component ─────────────────────────────────────────────────
   // Uses inline styles + CSS vars — zero dependency on Fluxer's hashed classes.
@@ -468,12 +484,21 @@
           onToggle: async (on) => {
             const all = await getImported();
             const t = all.find(x => x.id === p.id);
-            if (t) { t.enabled = on; await saveImported(all); }
+            if (!t) return;
+            if (on) startImportedPlugin(t);
+            else stopImportedPlugin(t.id);
+            t.enabled = on;
+            await saveImported(all);
           },
           onRemove: async () => {
             const all = await getImported();
             const idx = all.findIndex(x => x.id === p.id);
-            if (idx !== -1) { all.splice(idx, 1); await saveImported(all); renderPlugins(); }
+            if (idx !== -1) {
+              stopImportedPlugin(p.id);
+              all.splice(idx, 1);
+              await saveImported(all);
+              renderPlugins();
+            }
           },
         });
         instContent.appendChild(card);
@@ -528,7 +553,7 @@
         const all    = await getImported();
         all.push(plugin);
         await saveImported(all);
-        runPlugin(source);
+        startImportedPlugin(plugin);
         await renderPlugins();
       };
       reader.readAsText(file);

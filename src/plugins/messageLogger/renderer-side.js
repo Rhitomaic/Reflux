@@ -55,27 +55,24 @@
   window.WebSocket = PatchedWS;
 
   // ── 2. JSON.parse hook ─────────────────────────────────────────────────────
-  const _origParse = JSON.parse;
-
-  JSON.parse = function interceptedJSONParse(text, ...rest) {
-    const result = _origParse.call(this, text, ...rest);
-    try {
-      if (
-        result !== null &&
-        typeof result === 'object' &&
-        result.op === 0 &&
-        typeof result.t === 'string'
-      ) {
-        onGatewayDispatch(result);
-      }
-    } catch { /* never break Fluxer */ }
-    return result;
-  };
-
-  Object.defineProperty(JSON.parse, 'toString', {
-    value: () => _origParse.toString(),
-    configurable: true,
-  });
+  const _unpatchJSONParse = window.__reflux?.patcher?.instead?.(
+    JSON,
+    'parse',
+    (args, original) => {
+      const result = original(...args);
+      try {
+        if (
+          result !== null &&
+          typeof result === 'object' &&
+          result.op === 0 &&
+          typeof result.t === 'string'
+        ) {
+          onGatewayDispatch(result);
+        }
+      } catch { /* never break Fluxer */ }
+      return result;
+    },
+  ) ?? (() => {});
 
   // ── Gateway handler ────────────────────────────────────────────────────────
 
@@ -310,7 +307,7 @@
       domWatcher.disconnect();
       clearTimeout(_watchTimer);
       window.WebSocket = _OrigWS;
-      JSON.parse = _origParse;
+      _unpatchJSONParse();
       document.querySelectorAll('[data-reflux-ghost]').forEach(el => el.remove());
       document.querySelectorAll('.rx-edit-original').forEach(el => el.remove());
       document.querySelectorAll('[data-reflux-edited]').forEach(el => {

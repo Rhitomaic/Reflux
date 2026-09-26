@@ -332,6 +332,76 @@
     },
 
     /**
+     * Find the first already-loaded module whose exports contain all keys.
+     * @param {...string} props
+     * @returns {any|null}
+     */
+    findByProps(...props) {
+      return this.findModules((exports) => {
+        if (!exports || (typeof exports !== 'object' && typeof exports !== 'function')) return false;
+        return props.every((prop) => prop in exports);
+      })[0]?.exports ?? null;
+    },
+
+    /**
+     * Find the first already-loaded function export by name or displayName.
+     * @param {string} name
+     * @returns {Function|null}
+     */
+    findByName(name) {
+      const matches = this.findModules((exports) => {
+        const isMatch = (value) => value && (value.displayName === name || value.name === name);
+        return isMatch(exports) || (exports && typeof exports === 'object' && Object.values(exports).some(isMatch));
+      });
+      const exports = matches[0]?.exports;
+      if (!exports) return null;
+      if (exports.displayName === name || exports.name === name) return exports;
+      return Object.values(exports).find((value) => value && (value.displayName === name || value.name === name)) ?? null;
+    },
+
+    /**
+     * Find the first loaded module whose webpack factory source contains all snippets.
+     * @param {...string} snippets
+     * @returns {any|null}
+     */
+    findByCode(...snippets) {
+      if (!_webpackRequire?.c || !_webpackRequire?.m) return null;
+      for (const [id, module] of Object.entries(_webpackRequire.c)) {
+        const factory = _webpackRequire.m[id];
+        if (!module?.exports || typeof factory !== 'function') continue;
+        let source;
+        try { source = Function.prototype.toString.call(factory); }
+        catch { continue; }
+        if (snippets.every((snippet) => source.includes(snippet))) return module.exports;
+      }
+      return null;
+    },
+
+    /** Run a callback before an object's method. Callback receives the mutable args array. */
+    before(target, method, callback) {
+      return _patchMethod(target, method, (args, original, context) => {
+        callback.apply(context, [args]);
+        return original.apply(context, args);
+      });
+    },
+
+    /** Run a callback after an object's method. A returned value replaces the result. */
+    after(target, method, callback) {
+      return _patchMethod(target, method, (args, original, context) => {
+        const result = original.apply(context, args);
+        const next = callback.apply(context, [args, result]);
+        return next === undefined ? result : next;
+      });
+    },
+
+    /** Replace an object's method. Callback receives the args array and bound original. */
+    instead(target, method, callback) {
+      return _patchMethod(target, method, (args, original, context) =>
+        callback.apply(context, [args, original.bind(context)])
+      );
+    },
+
+    /**
      * Convenience: patch a module that has a specific display name (React components).
      * @param {string}                           displayName
      * @param {(exports: any, id: any) => any}   callback
@@ -420,6 +490,124 @@
     events,
   };
 
+  function _patchMethod(target, method, invoke) {
+    if (!target || typeof target[method] !== 'function') return () => {};
+    const original = target[method];
+    const patched = function refluxPatchedMethod(...args) {
+      return invoke(args, original, this);
+    };
+    target[method] = patched;
+    return () => {
+      if (target[method] === patched) target[method] = original;
+    };
+  }
+
+  let _uiNavigationInProgress = false;
+
+  const ui = {
+    find(selector, root = document) {
+      return root?.querySelector?.(selector) ?? null;
+    },
+
+    findAll(selector, root = document) {
+      return root?.querySelectorAll ? Array.from(root.querySelectorAll(selector)) : [];
+    },
+
+    findByText(text, root = document, exact = false) {
+      const needle = String(text).trim();
+      return this.findAll('*', root).find((element) => {
+        const value = element.textContent?.trim() ?? '';
+        return value && (exact ? value === needle : value.includes(needle)) &&
+          !Array.from(element.children).some((child) => child.textContent?.trim() === value);
+      }) ?? null;
+    },
+
+    findByRole(role, name, root = document) {
+      const selector = `[role="${CSS.escape(String(role))}"]`;
+      const elements = this.findAll(selector, root);
+      if (name === undefined) return elements[0] ?? null;
+      const needle = String(name).trim().toLowerCase();
+      return elements.find((element) =>
+        (element.getAttribute('aria-label') || element.textContent || '').trim().toLowerCase().includes(needle)
+      ) ?? null;
+    },
+
+    waitFor(selector, {root = document, timeout = 10000} = {}) {
+      const existing = this.find(selector, root);
+      if (existing) return Promise.resolve(existing);
+      return new Promise((resolve) => {
+        let settled = false;
+        const observer = new MutationObserver(() => {
+          const element = this.find(selector, root);
+          if (!element || settled) return;
+          settled = true;
+          observer.disconnect();
+          if (timer) clearTimeout(timer);
+          resolve(element);
+        });
+        observer.observe(root === document ? document.documentElement : root, {childList: true, subtree: true});
+        const timer = timeout > 0 ? setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          observer.disconnect();
+          resolve(null);
+        }, timeout) : null;
+      });
+    },
+
+    click(target, root = document) {
+      const element = typeof target === 'string' ? this.find(target, root) : target;
+      if (!element || typeof element.click !== 'function') return false;
+      element.click();
+      return true;
+    },
+
+    injectCSS(id, cssText) {
+      const styleId = `reflux-style-${id}`;
+      let style = document.getElementById(styleId);
+      if (!style) {
+        style = document.createElement('style');
+        style.id = styleId;
+        document.head.appendChild(style);
+      }
+      style.textContent = String(cssText);
+      return () => {
+        if (style?.parentNode) style.remove();
+      };
+    },
+
+    navigate(to, {replace = false, state = null} = {}) {
+      const url = new URL(to, window.location.href);
+      _uiNavigationInProgress = true;
+      try { window.history[replace ? 'replaceState' : 'pushState'](state, '', url.href); }
+      finally { _uiNavigationInProgress = false; }
+      window.dispatchEvent(new PopStateEvent('popstate', {state}));
+      return url;
+    },
+
+    onNavigate(callback) {
+      const notify = (event) => callback(new URL(window.location.href), event);
+      const unpatchPush = _patchMethod(window.history, 'pushState', (args, original, context) => {
+        const result = original.apply(context, args);
+        if (!_uiNavigationInProgress) notify(new Event('reflux:navigate'));
+        return result;
+      });
+      const unpatchReplace = _patchMethod(window.history, 'replaceState', (args, original, context) => {
+        const result = original.apply(context, args);
+        if (!_uiNavigationInProgress) notify(new Event('reflux:navigate'));
+        return result;
+      });
+      window.addEventListener('popstate', notify);
+      window.addEventListener('hashchange', notify);
+      return () => {
+        unpatchPush();
+        unpatchReplace();
+        window.removeEventListener('popstate', notify);
+        window.removeEventListener('hashchange', notify);
+      };
+    },
+  };
+
   // ---------------------------------------------------------------------------
   // Plugin registry (renderer-side)
   // ---------------------------------------------------------------------------
@@ -464,6 +652,7 @@
   const __reflux = {
     version:       '1.0.0',
     patcher,
+    ui,
     pluginManager,
     events,
   };
