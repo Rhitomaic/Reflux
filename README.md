@@ -28,6 +28,7 @@
 |---|---|
 | **Settings UI** | Adds a "Reflux" sidebar section to Fluxer settings with plugin toggles and import |
 | **Message Logger** | Intercepts `MESSAGE_DELETE` gateway events and re-displays deleted messages inline |
+| **Gateway Debug Tools** | Captures redacted gateway event summaries in a copyable in-app log |
 
 <h2 align="center">Install</h2>
 
@@ -140,6 +141,7 @@ src/
   plugins/
     settingsUI/     Settings panel injected into Fluxer's native settings UI
     messageLogger/  Deleted message logger via gateway WebSocket interception
+    debugTools/    Redacted gateway event inspector with copyable logs
 ```
 
 <h2 align="center">What injection modifies</h2>

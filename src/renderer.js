@@ -223,6 +223,7 @@
 
     // Clean up the Object.defineProperty hook after a short delay.
     setTimeout(_cleanup, 5000);
+
   }
 
   /**
