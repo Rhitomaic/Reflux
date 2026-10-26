@@ -42,8 +42,37 @@ That's it. Reflux discovers and loads it automatically on the next Fluxer launch
 | `displayName` | `string` | | Human-readable name shown in the UI. Defaults to `name`. |
 | `description` | `string` | | Short description shown in the plugin card. |
 | `rendererSrc` | `string \| null` | | Absolute path to a renderer-side script injected into the Fluxer web context. |
+| `settings` | `array` | | Optional settings schema rendered below the plugin card. See [Plugin settings](#plugin-settings). |
 | `start()` | `function` | ✅ | Called when the plugin is enabled. |
 | `stop()` | `function` | ✅ | Called when the plugin is disabled or Reflux unloads. |
+
+### Plugin settings
+
+`settings` is an array of option descriptors. Reflux renders supported option
+types below the plugin's toggle in **Reflux → Plugins** and saves values at
+`plugins.<plugin-name>.<setting-key>`.
+
+```js
+module.exports = {
+  name: 'myPlugin',
+  displayName: 'My Plugin',
+  description: 'Does stuff.',
+  settings: [
+    {
+      key: 'showBadge',
+      label: 'Show badge',
+      description: 'Display a small badge next to message authors.',
+      type: 'boolean',
+      default: true,
+    },
+  ],
+};
+```
+
+Currently supported types are `boolean` and `hidden`. Renderer plugins can
+subscribe to changes through `window.__reflux.events.on('setting-changed', ...)`
+or by listening for the `reflux:setting-changed` DOM event. Both receive
+`(key, value)` / `event.detail = {key, value}`.
 
 ---
 
@@ -261,7 +290,76 @@ const volume = await window.refluxBridge.getSetting('myPlugin.volume', 100);
 await window.refluxBridge.setSetting('myPlugin.volume', 80);
 ```
 
-Settings are stored in `%APPDATA%\Reflux\settings.json` under your plugin's key namespace.
+Settings are stored in `%APPDATA%\Reflux\settings.json` on Windows, or
+`$XDG_CONFIG_HOME/Reflux/settings.json` (usually `~/.config/Reflux/settings.json`)
+on Linux, under your plugin's key namespace.
+
+---
+
+## Plugin data storage
+
+Use plugin data for state that is not configuration: caches, logs, saved
+history, and other larger or frequently-written values. Each plugin gets its own
+JSON file under `plugin-data/<plugin-name>.json` next to `settings.json`.
+
+```js
+// Read (returns defaultValue when the file is missing)
+const state = await window.refluxBridge.readPluginData('myPlugin', {items: []});
+
+// Write atomically
+await window.refluxBridge.writePluginData('myPlugin', {items: [1, 2, 3]});
+
+// Delete the plugin's file
+await window.refluxBridge.clearPluginData('myPlugin');
+```
+
+Plugin names are sanitised before they are used as filenames. Data written here
+is separate from settings and is never loaded automatically; your plugin decides
+when to call `readPluginData()`.
+
+---
+
+## Context menus
+
+`window.__reflux.contextMenu` is a small plugin-owned menu layer. Register a
+provider that returns items for the elements it understands. Returning items
+suppresses Fluxer's native context menu for that target; returning `null` lets
+Fluxer handle it normally.
+
+```js
+const unregister = window.__reflux.contextMenu.register((target) => {
+  const item = target.closest?.('[data-my-plugin-item]');
+  if (!item) return null;
+
+  return {
+    title: 'My Plugin',
+    items: [
+      {
+        label: 'Do something',
+        icon: mySvgString, // optional inline SVG or text
+        action: (event, targetElement) => {
+          console.log('clicked', item);
+        },
+      },
+      {type: 'separator'},
+      {
+        label: 'Delete',
+        danger: true,
+        action: () => item.remove(),
+      },
+    ],
+  };
+});
+
+// Call from your plugin's stop()
+unregister();
+```
+
+Menu items support `label`, `action`, `icon`, `danger`, `disabled`, `hint`, and
+`type: 'separator'`. Providers are evaluated in registration order and results
+are merged, so multiple plugins can contribute items for the same target.
+`contextMenu.open(items, {x, y, target, title})` can also open a menu manually,
+and `contextMenu.close()` / `contextMenu.isOpen()` are available.
 
 ---
 

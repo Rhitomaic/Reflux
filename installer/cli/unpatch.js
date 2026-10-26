@@ -42,9 +42,17 @@ const PRODUCT_DIRS = process.platform === 'win32'
     path.join(dataHome, 'fluxer_app'),
     path.join(home, '.config', 'Fluxer'),
     path.join(home, '.config', 'fluxer'),
+    '/opt/Fluxer/resources',
+    '/opt/fluxer/resources',
+    '/opt/fluxer-bin/resources',
+    '/opt/fluxer_app/resources',
+    '/usr/lib/Fluxer/resources',
+    '/usr/lib/fluxer/resources',
+    '/usr/share/Fluxer/resources',
+    '/usr/share/fluxer/resources',
   ];
 
-const ASAR_PRELOAD_ENTRY = 'src-electron/dist/preload/index.js';
+const ASAR_PRELOAD_ENTRY = 'dist/preload/index.cjs';
 
 function findLatestResourcesDir(productDir) {
   if (!fs.existsSync(productDir)) return null;

@@ -250,7 +250,7 @@
 
   // ─── Plugin card component ─────────────────────────────────────────────────
   // Uses inline styles + CSS vars — zero dependency on Fluxer's hashed classes.
-  function makePluginCard({ id, icon, name, description, author, version, badge, enabled, onToggle, onRemove }) {
+  function makePluginCard({ id, icon, name, description, author, version, badge, enabled, onToggle, onRemove, settings = [], settingValues = {}, onSettingChange }) {
     const card = document.createElement('div');
     card.dataset.rxId = id;
     card.style.cssText = [
@@ -301,6 +301,44 @@
       desc.style.cssText = 'font-size:13px;color:var(--text-muted,#949ba4);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
       desc.textContent = description;
       info.appendChild(desc);
+    }
+
+    // Optional per-plugin settings declared in the plugin's `settings` array.
+    const visibleSettings = (settings || []).filter(s => s && s.key && s.type !== 'hidden');
+    if (visibleSettings.length) {
+      const settingsWrap = document.createElement('div');
+      settingsWrap.style.cssText = 'display:flex;flex-direction:column;gap:8px;margin-top:10px;padding-top:10px;border-top:1px solid var(--background-modifier-accent,rgba(255,255,255,0.06));';
+
+      for (const setting of visibleSettings) {
+        if (setting.type === 'boolean') {
+          const row = document.createElement('div');
+          row.style.cssText = 'display:flex;align-items:center;gap:12px;min-width:0;';
+
+          const text = document.createElement('div');
+          text.style.cssText = 'flex:1;min-width:0;';
+          const label = document.createElement('div');
+          label.style.cssText = 'font-size:13px;font-weight:500;color:var(--text-normal,#dbdee1);';
+          label.textContent = setting.label || setting.key;
+          text.appendChild(label);
+          if (setting.description) {
+            const hint = document.createElement('div');
+            hint.style.cssText = 'font-size:12px;line-height:1.35;color:var(--text-muted,#949ba4);margin-top:2px;';
+            hint.textContent = setting.description;
+            text.appendChild(hint);
+          }
+
+          const toggle = makeToggle(Boolean(settingValues[setting.key]), async (on) => {
+            if (!onSettingChange) return;
+            await onSettingChange(setting, on);
+          });
+
+          row.appendChild(text);
+          row.appendChild(toggle);
+          settingsWrap.appendChild(row);
+        }
+      }
+
+      if (settingsWrap.childElementCount) info.appendChild(settingsWrap);
     }
 
     // Right: toggle
@@ -452,6 +490,19 @@
       } catch { /* ignore */ }
 
       for (const p of builtins) {
+        const settingValues = {};
+        for (const setting of p.settings || []) {
+          if (!setting?.key) continue;
+          try {
+            settingValues[setting.key] = await window.refluxBridge?.getSetting(
+              `plugins.${p.name}.${setting.key}`,
+              setting.default,
+            );
+          } catch {
+            settingValues[setting.key] = setting.default;
+          }
+        }
+
         const card = makePluginCard({
           id:          'rx-' + p.name,
           icon:        p.icon || null,
@@ -459,6 +510,14 @@
           description: p.description || '',
           badge:       'Built-in',
           enabled:     p.enabled ?? true,
+          settings:    p.settings || [],
+          settingValues,
+          onSettingChange: async (setting, value) => {
+            const key = `plugins.${p.name}.${setting.key}`;
+            await window.refluxBridge?.setSetting(key, value);
+            window.__reflux?.events?.emit?.('setting-changed', key, value);
+            window.dispatchEvent(new CustomEvent('reflux:setting-changed', {detail: {key, value}}));
+          },
           onToggle: async (on) => {
             try {
               if (on) await window.refluxBridge?.enablePlugin(p.name);

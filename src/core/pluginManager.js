@@ -156,6 +156,7 @@ function list() {
     description:  entry.module.description || '',
     icon:         entry.module.icon         || null,
     rendererSrc:  entry.module.rendererSrc  || null,
+    settings:     Array.isArray(entry.module.settings) ? entry.module.settings : [],
     started:      entry.started,
     enabled:      _isEnabled(name),
   }));

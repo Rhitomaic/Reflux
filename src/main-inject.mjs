@@ -2,13 +2,14 @@
  * src/main-inject.mjs
  *
  * Reflux main-process bootstrap.  Injected via a prepended
- * `await import(...)` line into Fluxer's src-electron/dist/main/index.js.
+ * `await import(...)` line into Fluxer's dist/main/index.js.
  *
  * Responsibilities:
  *   1. Wire IPC handlers for settings + plugin management.
  *   2. Strip Content-Security-Policy headers so renderer.js can run.
- *   3. On every new BrowserWindow dom-ready, inject renderer.js into the web
- *      context (https://web.fluxer.app) AND any enabled plugin renderer scripts.
+ *   3. On every new Fluxer renderer dom-ready, inject renderer.js into the
+ *      web context (fluxer-app://app/ or https://web.fluxer.app) AND any
+ *      enabled plugin renderer scripts.
  *   4. Start main-process-side plugin logic.
  *
  * This file is ESM because Fluxer's main process uses `"type":"module"`.
@@ -39,11 +40,13 @@ const PRELOAD_PATH   = nodePath.join(REFLUX_ROOT, 'src', 'preload.js');
 // ---------------------------------------------------------------------------
 
 const settings      = require('./core/settings.js');
+const pluginData    = require('./core/pluginData.js');
 const pluginManager = require('./core/pluginManager.js');
 
 // Register IPC handlers immediately (before app.whenReady so handlers are in
 // place by the time any renderer tries to call them).
 settings.registerIpc(ipcMain);
+pluginData.registerIpc(ipcMain);
 pluginManager.registerIpc(ipcMain, {
   // Inject (or re-inject) a plugin's renderer script into all live Fluxer tabs.
   // The plugin's renderer-side IIFE must reset its own guard flag in stop() for
@@ -71,21 +74,40 @@ pluginManager.registerIpc(ipcMain, {
   },
 });
 
-// Load and start all enabled plugins (main-process side).
-pluginManager.loadAll();
+// Plugins are started after app.whenReady() — some (notably invisibleTyping)
+// need Electron's session APIs, which cannot be used before the app is ready.
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 /**
- * Return all live Fluxer web contents (pages loaded on web.fluxer.app).
+ * Is this WebContents one of Fluxer's app renderers?
+ *
+ * Fluxer's packaged desktop app serves the renderer from `fluxer-app://app/`;
+ * the browser build uses `https://web.fluxer.app`.  The updater/splash window
+ * uses `file://` and must not receive the renderer bootstrap or plugins.
+ *
+ * @param {Electron.WebContents} wc
+ * @returns {boolean}
+ */
+function isFluxerRenderer(wc) {
+  try {
+    const url = wc.getURL();
+    return url.startsWith('fluxer-app://app') || url.includes('web.fluxer.app');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Return all live Fluxer renderer web contents.
  * Used to push live enable/disable changes without requiring a restart.
  * @returns {Electron.WebContents[]}
  */
 function getFluxerWebContents() {
   return webContents.getAllWebContents().filter(wc => {
-    try { return !wc.isDestroyed() && wc.getURL().includes('web.fluxer.app'); }
+    try { return !wc.isDestroyed() && isFluxerRenderer(wc); }
     catch { return false; }
   });
 }
@@ -108,7 +130,7 @@ function getRendererScript() {
  * @param {Electron.WebContents} wc
  */
 async function injectAll(wc) {
-  if (wc.isDestroyed()) return;
+  if (wc.isDestroyed() || !isFluxerRenderer(wc)) return;
 
   // 1. Core renderer bootstrap (webpack patcher + plugin manager).
   const core = getRendererScript();
@@ -175,6 +197,10 @@ app.whenReady().then(() => {
   session.defaultSession.setPreloads([PRELOAD_PATH]);
 
   stripCsp(session.defaultSession);
+
+  // Load and start all enabled plugins (main-process side).  This must happen
+  // after app ready because plugins may touch Electron session APIs.
+  pluginManager.loadAll();
 
   console.log(
     `[Reflux:Main] Ready. Settings: ${settings.SETTINGS_FILE}\n` +

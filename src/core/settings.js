@@ -2,7 +2,8 @@
  * src/core/settings.js
  *
  * Persistent settings for Reflux.
- * Reads/writes %APPDATA%\Reflux\settings.json.
+ * Reads/writes %APPDATA%\Reflux\settings.json on Windows and
+ * $XDG_CONFIG_HOME/Reflux/settings.json (usually ~/.config/Reflux) on Linux.
  *
  * Used directly from the main process (src/main-inject.mjs) and exposed to
  * the renderer via IPC (the ipcMain handlers are registered here).
@@ -18,17 +19,28 @@
 'use strict';
 
 const fs   = require('node:fs');
+const os   = require('node:os');
 const path = require('node:path');
 
 // ---------------------------------------------------------------------------
 // Storage path
 // ---------------------------------------------------------------------------
 
+const HOME = os.homedir();
 const APPDATA = process.env.APPDATA
-  || path.join(process.env.USERPROFILE || require('node:os').homedir(), 'AppData', 'Roaming');
+  || path.join(process.env.USERPROFILE || HOME, 'AppData', 'Roaming');
+const XDG_CONFIG_HOME = process.env.XDG_CONFIG_HOME || path.join(HOME, '.config');
 
-const SETTINGS_DIR  = path.join(APPDATA, 'Reflux');
+const SETTINGS_DIR = process.platform === 'win32'
+  ? path.join(APPDATA, 'Reflux')
+  : process.platform === 'darwin'
+    ? path.join(HOME, 'Library', 'Application Support', 'Reflux')
+    : path.join(XDG_CONFIG_HOME, 'Reflux');
 const SETTINGS_FILE = path.join(SETTINGS_DIR, 'settings.json');
+
+// Older Linux builds incorrectly used the Windows-style path.  Copy that file
+// forward once so existing plugin state is not lost.
+const LEGACY_SETTINGS_FILE = path.join(HOME, 'AppData', 'Roaming', 'Reflux', 'settings.json');
 
 // ---------------------------------------------------------------------------
 // In-memory cache
@@ -37,8 +49,21 @@ const SETTINGS_FILE = path.join(SETTINGS_DIR, 'settings.json');
 /** @type {Record<string, any>|null} */
 let _cache = null;
 
+function _migrateLegacySettings() {
+  if (path.resolve(SETTINGS_FILE) === path.resolve(LEGACY_SETTINGS_FILE)) return;
+  if (fs.existsSync(SETTINGS_FILE) || !fs.existsSync(LEGACY_SETTINGS_FILE)) return;
+  try {
+    fs.mkdirSync(SETTINGS_DIR, { recursive: true });
+    fs.copyFileSync(LEGACY_SETTINGS_FILE, SETTINGS_FILE);
+    console.log(`[Reflux:Settings] Migrated settings to ${SETTINGS_FILE}`);
+  } catch (err) {
+    console.error('[Reflux:Settings] Legacy settings migration failed:', err.message);
+  }
+}
+
 function _load() {
   if (_cache !== null) return;
+  _migrateLegacySettings();
   try {
     _cache = fs.existsSync(SETTINGS_FILE)
       ? JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'))

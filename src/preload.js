@@ -1,9 +1,8 @@
 /**
  * src/preload.js
  *
- * Reflux preload bootstrap.  Injected via a require() prepend into
- * Fluxer's already-unpacked preload script:
- *   app.asar.unpacked/src-electron/dist/preload/index.js
+ * Reflux preload bootstrap.  Registered at runtime by src/main-inject.mjs via
+ * session.setPreloads(); Fluxer's own preload is not modified.
  *
  * Fluxer's preload runs with:
  *   contextIsolation: true
@@ -42,6 +41,9 @@ const CH = {
   PLUGIN_LIST:    'reflux:plugin-list',
   PLUGIN_ENABLE:  'reflux:plugin-enable',
   PLUGIN_DISABLE: 'reflux:plugin-disable',
+  PLUGIN_DATA_READ:  'reflux:plugin-data-read',
+  PLUGIN_DATA_WRITE: 'reflux:plugin-data-write',
+  PLUGIN_DATA_CLEAR: 'reflux:plugin-data-clear',
 };
 
 // ---------------------------------------------------------------------------
@@ -67,6 +69,18 @@ try {
 
     /** Disable a named plugin. */
     disablePlugin: (name) => ipcRenderer.invoke(CH.PLUGIN_DISABLE, name),
+
+    /** Read plugin-owned JSON data (not settings). */
+    readPluginData: (name, defaultValue = null) =>
+      ipcRenderer.invoke(CH.PLUGIN_DATA_READ, name, defaultValue),
+
+    /** Write plugin-owned JSON data (not settings). */
+    writePluginData: (name, value) =>
+      ipcRenderer.invoke(CH.PLUGIN_DATA_WRITE, name, value),
+
+    /** Delete plugin-owned JSON data. */
+    clearPluginData: (name) =>
+      ipcRenderer.invoke(CH.PLUGIN_DATA_CLEAR, name),
 
     /** Reflux version string. */
     version: '1.0.0',

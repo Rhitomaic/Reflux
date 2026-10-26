@@ -49,6 +49,21 @@ const SECTIONS = [sWelcome, sTos, sLoading, sReady, sOp, sDone];
 
 // ── Section transitions ────────────────────────────────────────────────────────
 let _active = null;
+let _transitionId = 0;
+const _animHandlers = new WeakMap();
+
+function clearAnimHandler(el) {
+	const handler = _animHandlers.get(el);
+	if (!handler) return;
+	el.removeEventListener('animationend', handler);
+	_animHandlers.delete(el);
+}
+
+function setAnimHandler(el, handler) {
+	clearAnimHandler(el);
+	_animHandlers.set(el, handler);
+	el.addEventListener('animationend', handler);
+}
 
 function showSection(el, direction = 'forward') {
 	const prev = _active;
@@ -57,6 +72,7 @@ function showSection(el, direction = 'forward') {
 	if (!prev) {
 		// Initial render — no animation
 		SECTIONS.forEach((s) => {
+			clearAnimHandler(s);
 			s.style.display = 'none';
 			s.className = 'section';
 		});
@@ -66,6 +82,14 @@ function showSection(el, direction = 'forward') {
 	}
 
 	if (prev === el) return;
+
+	// Invalidate any animation callbacks from the previous transition before
+	// cancelling its animation classes.  Without this, a fast IPC response can
+	// transition again while the old animation is still running; the stale
+	// animationend handler would then hide the new section and leave the card
+	// blank.
+	const token = ++_transitionId;
+	SECTIONS.forEach(clearAnimHandler);
 
 	// Hide all unrelated sections immediately
 	SECTIONS.forEach((s) => {
@@ -79,8 +103,7 @@ function showSection(el, direction = 'forward') {
 	const exitClass = direction === 'forward' ? 'exit-left' : 'exit-right';
 
 	// Reset both elements to cancel any in-progress animation before starting new ones.
-	// Without this, a fast IPC response can call showSection again before the previous
-	// enter animation finishes, leaving stale animationend listeners that corrupt state.
+	prev.style.display = 'block';
 	prev.className = 'section';
 	void prev.offsetWidth;
 	el.style.display = 'block';
@@ -89,24 +112,22 @@ function showSection(el, direction = 'forward') {
 
 	// Outgoing: absolutely positioned so it doesn't push layout
 	prev.className = `section is-exiting ${exitClass}`;
-	prev.addEventListener(
-		'animationend',
-		() => {
-			prev.style.display = 'none';
-			prev.className = 'section';
-		},
-		{once: true},
-	);
+	setAnimHandler(prev, (event) => {
+		if (event.target !== prev) return;
+		clearAnimHandler(prev);
+		if (token !== _transitionId) return;
+		prev.style.display = 'none';
+		prev.className = 'section';
+	});
 
 	// Incoming
 	el.className = `section is-entering ${enterClass}`;
-	el.addEventListener(
-		'animationend',
-		() => {
-			el.className = 'section active';
-		},
-		{once: true},
-	);
+	setAnimHandler(el, (event) => {
+		if (event.target !== el) return;
+		clearAnimHandler(el);
+		if (token !== _transitionId) return;
+		el.className = 'section active';
+	});
 }
 
 // ── Step indicator ─────────────────────────────────────────────────────────────

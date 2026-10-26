@@ -2,8 +2,9 @@
  * src/renderer.js
  *
  * Reflux renderer bootstrap.  Injected into Fluxer's web context
- * (https://web.fluxer.app) via webContents.executeJavaScript() from
- * src/main-inject.mjs after CSP headers have been stripped.
+ * (fluxer-app://app/ in the desktop app, https://web.fluxer.app in the browser)
+ * via webContents.executeJavaScript() from src/main-inject.mjs after CSP
+ * headers have been stripped.
  *
  * Responsibilities:
  *   1. Hook into Fluxer's webpack module system (rspack / webpack 5 chunk API)
@@ -610,6 +611,323 @@
   };
 
   // ---------------------------------------------------------------------------
+  // Context menu API
+  // ---------------------------------------------------------------------------
+
+  /**
+   * A small, plugin-owned context-menu layer.  Providers are asked on every
+   * `contextmenu` event; the first providers to return items win, and the
+   * native Fluxer menu is suppressed for those targets.
+   *
+   * Provider shape:
+   *   (target, event) => MenuItem[] | { title?: string, items: MenuItem[] } | null
+   *
+   * MenuItem shape:
+   *   { label, action, icon?, danger?, disabled?, hint?, type?: 'separator' }
+   */
+  const contextMenu = (() => {
+    /** @type {Set<Function|object>} */
+    const providers = new Set();
+    let menuEl = null;
+    let currentTarget = null;
+    let closeOnPointerDown = null;
+
+    const MENU_CSS = `
+      .reflux-context-menu {
+        position: fixed;
+        z-index: 2147483647;
+        min-width: 13rem;
+        max-width: min(21.5rem, calc(100vw - 1.5rem));
+        max-height: calc(100vh - 1.5rem);
+        padding: .375rem;
+        box-sizing: border-box;
+        display: flex;
+        flex-direction: column;
+        overflow: auto;
+        background: var(--form-surface-background, var(--background-floating, #313338));
+        border: 1px solid var(--background-modifier-accent, rgba(255,255,255,.08));
+        border-radius: .5rem;
+        box-shadow: 0 .5rem 1rem rgba(0,0,0,.24);
+        color: var(--text-primary, var(--text-normal, #dbdee1));
+        font-size: .8125rem;
+        font-weight: 500;
+        line-height: 1.125rem;
+        -webkit-app-region: no-drag;
+      }
+      .reflux-context-menu-item {
+        all: unset;
+        display: flex;
+        align-items: center;
+        gap: .5rem;
+        width: 100%;
+        min-height: 2rem;
+        padding: .3125rem .5rem;
+        box-sizing: border-box;
+        border: 1px solid transparent;
+        border-radius: .375rem;
+        color: var(--text-primary, var(--text-normal, #dbdee1));
+        cursor: pointer;
+        font: inherit;
+        text-align: left;
+      }
+      .reflux-context-menu-item:hover,
+      .reflux-context-menu-item:focus-visible {
+        background: var(--surface-interactive-hover-bg, var(--background-modifier-hover, rgba(255,255,255,.06)));
+        color: var(--text-primary, var(--text-normal, #fff));
+        outline: none;
+      }
+      .reflux-context-menu-item[disabled] {
+        opacity: .5;
+        cursor: not-allowed;
+      }
+      .reflux-context-menu-item-danger {
+        color: var(--status-danger, #ed4245);
+      }
+      .reflux-context-menu-item-danger:hover,
+      .reflux-context-menu-item-danger:focus-visible {
+        background: color-mix(in srgb, var(--status-danger, #ed4245) 12%, transparent);
+        color: var(--status-danger, #ed4245);
+      }
+      .reflux-context-menu-icon {
+        width: 1.125rem;
+        height: 1.125rem;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+      }
+      .reflux-context-menu-icon > svg {
+        width: 1.125rem;
+        height: 1.125rem;
+        display: block;
+      }
+      .reflux-context-menu-label {
+        display: flex;
+        align-items: center;
+        gap: .5rem;
+        min-width: 0;
+        flex: 1;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .reflux-context-menu-hint {
+        display: block;
+        color: var(--text-tertiary-muted, var(--text-muted, #949ba4));
+        font-size: .75rem;
+        font-weight: 400;
+        line-height: 1rem;
+        margin-top: .0625rem;
+        white-space: normal;
+      }
+      .reflux-context-menu-separator {
+        height: 1px;
+        margin: .25rem .125rem;
+        background: var(--background-modifier-accent, rgba(255,255,255,.08));
+        opacity: .55;
+      }
+    `;
+
+    let removeCss = null;
+    function ensureCss() {
+      if (!removeCss) removeCss = ui.injectCSS('context-menu', MENU_CSS);
+    }
+
+    function close() {
+      if (closeOnPointerDown) {
+        document.removeEventListener('pointerdown', closeOnPointerDown, true);
+        closeOnPointerDown = null;
+      }
+      if (menuEl?.parentNode) menuEl.remove();
+      menuEl = null;
+      currentTarget = null;
+    }
+
+    function makeMenuItem(item, onSelect) {
+      if (item?.type === 'separator') {
+        const sep = document.createElement('div');
+        sep.className = 'reflux-context-menu-separator';
+        sep.setAttribute('role', 'separator');
+        return sep;
+      }
+
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'reflux-context-menu-item';
+      button.setAttribute('role', 'menuitem');
+      if (item.danger) button.classList.add('reflux-context-menu-item-danger');
+      if (item.disabled) button.disabled = true;
+
+      if (item.icon) {
+        const icon = document.createElement('span');
+        icon.className = 'reflux-context-menu-icon';
+        if (item.icon instanceof Node) icon.appendChild(item.icon);
+        else if (/^\s*<svg[\s>]/i.test(String(item.icon))) icon.innerHTML = String(item.icon);
+        else icon.textContent = String(item.icon);
+        button.appendChild(icon);
+      }
+
+      const label = document.createElement('span');
+      label.className = 'reflux-context-menu-label';
+      const text = document.createElement('span');
+      text.textContent = String(item.label ?? '');
+      label.appendChild(text);
+      button.appendChild(label);
+
+      if (item.hint) {
+        const hint = document.createElement('span');
+        hint.className = 'reflux-context-menu-hint';
+        hint.textContent = String(item.hint);
+        label.style.display = 'block';
+        label.appendChild(hint);
+      }
+
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (item.disabled) return;
+        const target = currentTarget;
+        close();
+        try { item.action?.(event, target); }
+        catch (err) { console.error('[Reflux:ContextMenu] Menu action threw:', err); }
+        onSelect?.();
+      });
+
+      return button;
+    }
+
+    function positionMenu(menu, x, y) {
+      const edge = 8;
+      const rect = menu.getBoundingClientRect();
+      let left = x;
+      let top = y;
+      if (left + rect.width > window.innerWidth - edge) left = x - rect.width;
+      if (top + rect.height > window.innerHeight - edge) top = y - rect.height;
+      left = Math.max(edge, Math.min(left, window.innerWidth - rect.width - edge));
+      top = Math.max(edge, Math.min(top, window.innerHeight - rect.height - edge));
+      menu.style.left = `${Math.round(left)}px`;
+      menu.style.top = `${Math.round(top)}px`;
+    }
+
+    function open(items, {x = 0, y = 0, target = null, title = ''} = {}) {
+      close();
+      const list = Array.isArray(items) ? items.filter(Boolean) : [];
+      if (!list.length) return null;
+
+      ensureCss();
+      const menu = document.createElement('div');
+      menu.className = 'reflux-context-menu';
+      menu.setAttribute('role', 'menu');
+      if (title) menu.setAttribute('aria-label', String(title));
+      currentTarget = target;
+
+      for (const item of list) menu.appendChild(makeMenuItem(item));
+
+      document.body.appendChild(menu);
+      menuEl = menu;
+      positionMenu(menu, x, y);
+
+      for (const item of menu.querySelectorAll('.reflux-context-menu-item:not([disabled])')) {
+        item.setAttribute('tabindex', '-1');
+      }
+
+      closeOnPointerDown = (event) => {
+        if (menu.contains(event.target)) return;
+        close();
+      };
+      document.addEventListener('pointerdown', closeOnPointerDown, true);
+
+      const first = menu.querySelector('.reflux-context-menu-item:not([disabled])');
+      if (first) requestAnimationFrame(() => first.focus({preventScroll: true}));
+      return menu;
+    }
+
+    function getProviderItems(target, event) {
+      const items = [];
+      let title = '';
+      for (const provider of providers) {
+        try {
+          const result = typeof provider === 'function'
+            ? provider(target, event)
+            : provider.getItems?.(target, event);
+          if (!result) continue;
+          const resultItems = Array.isArray(result) ? result : result.items;
+          if (!Array.isArray(resultItems) || resultItems.length === 0) continue;
+          if (!Array.isArray(result) && result.title) title = String(result.title);
+          if (items.length && resultItems[0]?.type !== 'separator') {
+            items.push({type: 'separator'});
+          }
+          items.push(...resultItems);
+        } catch (err) {
+          console.error('[Reflux:ContextMenu] Provider threw:', err);
+        }
+      }
+      return {items, title};
+    }
+
+    function onContextMenu(event) {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const {items, title} = getProviderItems(target, event);
+      if (!items.length) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      open(items, {
+        x: event.clientX || 0,
+        y: event.clientY || 0,
+        target,
+        title,
+      });
+    }
+
+    function onKeyDown(event) {
+      if (!menuEl) return;
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        close();
+        return;
+      }
+      if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+      const items = Array.from(menuEl.querySelectorAll('.reflux-context-menu-item:not([disabled])'));
+      if (!items.length) return;
+      event.preventDefault();
+      const index = items.indexOf(document.activeElement);
+      const delta = event.key === 'ArrowDown' ? 1 : -1;
+      const next = index === -1
+        ? (delta > 0 ? 0 : items.length - 1)
+        : (index + delta + items.length) % items.length;
+      items[next].focus();
+    }
+
+    document.addEventListener('contextmenu', onContextMenu, true);
+    document.addEventListener('keydown', onKeyDown, true);
+    window.addEventListener('resize', close, true);
+    window.addEventListener('scroll', (event) => {
+      if (menuEl?.contains(event.target)) return;
+      close();
+    }, true);
+
+    return {
+      /**
+       * Register a context-menu provider.
+       * @param {Function|{getItems: Function}} provider
+       * @returns {() => void} unregister
+       */
+      register(provider) {
+        if (!provider) return () => {};
+        providers.add(provider);
+        return () => providers.delete(provider);
+      },
+      /** Open a menu manually. */
+      open,
+      close,
+      isOpen: () => Boolean(menuEl),
+    };
+  })();
+
+  // ---------------------------------------------------------------------------
   // Plugin registry (renderer-side)
   // ---------------------------------------------------------------------------
 
@@ -619,17 +937,25 @@
   const pluginManager = {
     /**
      * Register and start a renderer-side plugin.
-     * @param {{ name: string, start: (patcher, api) => (Function|void) }} plugin
+     *
+     * `plugin.start()` may return a cleanup function (the legacy API) or the
+     * plugin may provide `plugin.stop()`.  Both shapes are supported; the
+     * returned cleanup wins when both exist.
+     *
+     * @param {{ name: string, start: (patcher, api) => (Function|void), stop?: Function }} plugin
      */
     register(plugin) {
       if (_plugins.has(plugin.name)) {
         console.warn(`[Reflux] Plugin "${plugin.name}" already registered.`);
         return;
       }
-      let stop = null;
+      let cleanup = null;
       try {
-        stop = plugin.start(patcher, __reflux) ?? null;
-        _plugins.set(plugin.name, { plugin, stop });
+        const result = plugin.start?.(patcher, __reflux);
+        cleanup = typeof result === 'function'
+          ? result
+          : (typeof plugin.stop === 'function' ? () => plugin.stop() : null);
+        _plugins.set(plugin.name, { plugin, cleanup });
         console.log(`[Reflux] Plugin "${plugin.name}" started.`);
       } catch (err) {
         console.error(`[Reflux] Plugin "${plugin.name}" failed to start:`, err);
@@ -639,7 +965,7 @@
     unregister(name) {
       const entry = _plugins.get(name);
       if (!entry) return;
-      try { entry.stop?.(); } catch (err) { console.error(`[Reflux] "${name}" stop() threw:`, err); }
+      try { entry.cleanup?.(); } catch (err) { console.error(`[Reflux] "${name}" stop() threw:`, err); }
       _plugins.delete(name);
     },
 
@@ -654,6 +980,7 @@
     version:       '1.0.0',
     patcher,
     ui,
+    contextMenu,
     pluginManager,
     events,
   };

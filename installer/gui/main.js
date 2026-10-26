@@ -65,6 +65,7 @@ function getProductDirs() {
             ...getLinuxExecutableResourceDirs(),
             '/opt/Fluxer/resources',
             '/opt/fluxer/resources',
+            '/opt/fluxer-bin/resources',
             '/opt/fluxer_app/resources',
             '/usr/lib/Fluxer/resources',
             '/usr/lib/fluxer/resources',

@@ -14,8 +14,9 @@ process.noAsar = true;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const ASAR_MAIN_ENTRY = 'src-electron/dist/main/index.js';
-const ASAR_PRELOAD_ENTRY = 'src-electron/dist/preload/index.js';
+const ASAR_MAIN_ENTRY = 'dist/main/index.js';
+const ASAR_PRELOAD_ENTRY = 'dist/preload/index.cjs';
+const LEGACY_ASAR_MAIN_ENTRIES = ['src-electron/dist/main/index.js'];
 const GITHUB_REPO = 'its3rr0rswrld/Reflux';
 
 const HOME = process.env.HOME || os.homedir();
@@ -97,9 +98,13 @@ function safeRemoveDir(target) {
 }
 
 function safeMove(src, dest) {
-    if (requiresElevation(dest) || requiresElevation(src)) {
+    // Replacing a file needs write access to its parent directory, even when
+    // the file itself is writable (e.g. a user-owned app.asar under /opt).
+    if (requiresElevation(dest) || requiresElevation(src) || requiresElevation(path.dirname(dest))) {
         send('step', 'Requesting root permissions to write application files…');
-        execElevated(`mv -f "${src}" "${dest}"`);
+        // Use copy+remove instead of mv so an existing destination keeps its
+        // original owner and mode (app.asar must stay root-owned under /opt).
+        execElevated(`cp -f "${src}" "${dest}" && rm -f "${src}"`);
     } else {
         try {
             fs.renameSync(src, dest);
@@ -224,7 +229,7 @@ function getAsarEntry(files, entryPath) {
 }
 
 function findMainEntryInAsar(asarPath) {
-    const {header} = asar.readHeader(asarPath);
+    const {header} = asar.getRawHeader(asarPath);
 
     try {
         const pkg = JSON.parse(asar.extractFile(asarPath, 'package.json').toString('utf8'));
@@ -247,7 +252,7 @@ function findMainEntryInAsar(asarPath) {
 // ── Streaming asar patch ──────────────────────────────────────────────────────
 
 function patchAsarEntry(asarPath, entryPath, patchLine) {
-    const {header, headerSize} = asar.readHeader(asarPath);
+    const {header, headerSize} = asar.getRawHeader(asarPath);
     const dataStart = 8 + headerSize;
 
     const entry = getAsarEntry(header.files, entryPath);
