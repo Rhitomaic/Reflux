@@ -2794,15 +2794,21 @@
     register(provider) { return this.patch(provider); },
 
     openFromEvent(event, render, config) {
-      if (_ensureNativeMenuPatch()) return _nativeMenuModule.openFromEvent(event, render, config);
+      if (_ensureNativeMenuPatch() && _nativeMenuModule) {
+        return _nativeMenuModule.openFromEvent(event, render, config);
+      }
       return null;
     },
     openAtPoint(point, render, config) {
-      if (_ensureNativeMenuPatch()) return _nativeMenuModule.openAtPoint(point, render, config);
+      if (_ensureNativeMenuPatch() && _nativeMenuModule) {
+        return _nativeMenuModule.openAtPoint(point, render, config);
+      }
       return null;
     },
     openForElement(element, render, options) {
-      if (_ensureNativeMenuPatch()) return _nativeMenuModule.openForElement(element, render, options);
+      if (_ensureNativeMenuPatch() && _nativeMenuModule) {
+        return _nativeMenuModule.openForElement(element, render, options);
+      }
       return null;
     },
     close() {
@@ -2817,7 +2823,7 @@
     open(items, {x = 0, y = 0, target = null} = {}) {
       const list = Array.isArray(items) ? items.filter(Boolean) : [];
       if (!list.length) return null;
-      if (_ensureNativeMenuPatch() && _react) {
+      if (_ensureNativeMenuPatch() && _nativeMenuModule && _react) {
         return _nativeMenuModule.openAtPoint(
           {x, y},
           () => {
@@ -3578,8 +3584,10 @@
     const definitions = Array.isArray(plugin.commands)
       ? plugin.commands
       : (typeof plugin.commands === 'object'
-        ? Object.entries(plugin.commands).map(([name, command]) =>
-          typeof command === 'function' ? {name, execute: command} : {name, ...command})
+        ? (plugin.commands.name && typeof plugin.commands.execute === 'function'
+          ? [plugin.commands]
+          : Object.entries(plugin.commands).map(([name, command]) =>
+            typeof command === 'function' ? {name, execute: command} : {name, ...command}))
         : []);
     const cleanups = [];
     for (const definition of definitions) {
