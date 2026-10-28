@@ -61,6 +61,13 @@ That's it. Reflux discovers and loads it automatically on the next Fluxer launch
 | `messageDecorations` | `array \| object` | | Message extension components rendered alongside each message. |
 | `messageEvents` | `object` | | Optional `{create, update, delete, 'bulk-delete'}` handlers. |
 | `commands` | `array \| object` | | Slash commands registered by the plugin. See [Commands](#commands). |
+| `chatBarButtons` | `array \| object` | | Buttons added to the message composer action row. See [Chat-bar and message-popover buttons](#chat-bar-and-message-popover-buttons). |
+| `messagePopoverButtons` | `array \| object` | | Buttons added to each message's hover action bar. |
+| `memberBadges` / `userBadges` | `array \| object` | | Badges rendered for users in the member list and profile popouts. |
+| `serverBadges` / `guildBadges` | `array \| object` | | Badges rendered on guild/server list items. |
+| `memberDecorations` / `serverDecorations` | `array \| object` | | Generic decorations for member and server list rows. |
+| `ipcHandlers` | `object` | | Main-process native IPC handlers, automatically scoped to the plugin name. |
+| `rendererIpcHandlers` | `object` | | Renderer-side handlers for main → renderer IPC requests. |
 | `authors` | `array` | | Optional author metadata. |
 | `tags` | `string[]` | | Optional categories shown in the plugin UI. |
 | `dependencies` | `string[]` | | Names of plugins that must be enabled first. |
@@ -270,6 +277,61 @@ module.exports = {
 };
 ```
 
+### Native IPC from the main process
+
+Main-process plugins can expose functions that their renderer side calls, and
+can push events or requests back to Fluxer. Every channel is namespaced by the
+plugin name.
+
+```js
+// src/plugins/myPlugin/index.js
+module.exports = {
+  name: 'myPlugin',
+  rendererSrc: path.join(__dirname, 'renderer-side.js'),
+
+  ipcHandlers: {
+    async readConfig() {
+      return {theme: 'dark'};
+    },
+  },
+
+  start() {
+    // Ad-hoc handler, in addition to ipcHandlers.
+    this.ipc.handle('ping', (value) => `pong:${value}`);
+
+    // Push an event to every Fluxer renderer.
+    this.ipc.broadcast('status', {online: true});
+  },
+
+  stop() {},
+};
+```
+
+`this.ipc` (also available as `plugin.nativeIpc`) provides:
+
+- `handle(channel, fn)` / `remove(channel)` / `removeAll()`
+- `send(webContents, channel, data)` for one renderer
+- `broadcast(channel, data)` for every live Fluxer renderer
+- `request(channel, argsArray, options)` to call a renderer-side handler
+
+Renderer-side handlers are declared with `rendererIpcHandlers`:
+
+```js
+window.__reflux.pluginManager.register({
+  name: 'myPlugin',
+  rendererIpcHandlers: {
+    getSelection() {
+      return window.getSelection()?.toString() ?? '';
+    },
+  },
+  start() {},
+  stop() {},
+});
+```
+
+`ipcHandlers` and `rendererIpcHandlers` are removed automatically when the
+plugin stops. During hot reload the old handlers are replaced cleanly.
+
 ---
 
 ## Renderer side
@@ -316,6 +378,155 @@ module.exports = {
 ```
 
 > **Guard against double-injection** — always check a flag like `window.__myPlugin_loaded` at the top of your renderer script. Fluxer may reload pages without a full restart.
+
+### Renderer-side native IPC
+
+The renderer helper mirrors the main-process API and infers the plugin name so
+each plugin only talks to its own channels:
+
+```js
+const ipc = window.__reflux.pluginIpc.forPlugin('myPlugin');
+
+// Call a main-process ipcHandlers entry (or this.ipc.handle()).
+const config = await ipc.invoke('readConfig');
+const pong = await ipc.invoke('ping', 'hello');
+
+// Receive events broadcast by the main process.
+const offStatus = ipc.on('status', (data) => {
+  console.log('main says online:', data.online);
+});
+
+// Handle a request initiated by the main process.
+const offSelection = ipc.handle('getSelection', () => window.getSelection()?.toString() ?? '');
+
+// Clean up on stop().
+offStatus();
+offSelection();
+```
+
+`window.__reflux.pluginIpc.invoke(pluginName, channel, ...args)` is also
+available when you need to call another plugin's explicitly shared channel.
+The bridge is unavailable outside the Fluxer desktop app; check
+`window.__reflux.pluginIpc.available` if your plugin can run in a browser build.
+
+## Chat-bar and message-popover buttons
+
+Add buttons next to the composer controls or to a message's hover action bar.
+The registration returns a cleanup function. `filter` receives the current
+context, and `onClick` receives `(event, context)`.
+
+```js
+const offChat = window.__reflux.chatBar.addButton({
+  name: 'quickQuote',
+  label: 'Quote selected text',
+  icon: '<svg viewBox="0 0 24 24"><path d="M7 7h10v10H7z"/></svg>',
+  order: 10,
+  filter: ({channelId}) => Boolean(channelId),
+  onClick(_event, {channelId}) {
+    console.log('composer channel', channelId);
+  },
+});
+
+const offMessage = window.__reflux.messagePopover.addButton({
+  name: 'copyAuthor',
+  label: 'Copy author ID',
+  icon: 'ID',
+  filter: ({message}) => Boolean(message?.author?.id),
+  onClick(_event, {message}) {
+    navigator.clipboard?.writeText(message.author.id);
+  },
+});
+
+// Later, from stop():
+offChat();
+offMessage();
+```
+
+The message context includes `{message, messageId, channelId, row, root, element}`.
+The chat-bar context includes `{channel, channelId, element}`. You can also
+declare `chatBarButtons` or `messagePopoverButtons` as an object/array on the
+plugin definition; Reflux registers and cleans those up automatically.
+
+## Badges, member-list and server-list hooks
+
+`badges.registerUser()` renders a badge in member-list rows and user profile
+popouts. `badges.registerGuild()` renders on guild/server list items. The lower
+level `members` and `servers` helpers expose the same slots directly.
+
+```js
+const offUser = window.__reflux.badges.registerUser({
+  name: 'trusted',
+  label: 'Trusted',
+  description: 'Verified by My Plugin',
+  color: '#57f287',
+  filter: ({userId, user}) => userId && !user?.bot,
+});
+
+const offGuild = window.__reflux.servers.registerBadge({
+  name: 'managed',
+  label: 'Managed',
+  filter: ({guild}) => Boolean(guild?.ownerId),
+  onClick: (_event, {guildId}) => console.log('server', guildId),
+});
+```
+
+A badge definition may provide `label`, `icon` (SVG string, URL, emoji, or React
+node), `description`, `color`, `backgroundColor`, `borderColor`, `filter`, and
+`order`. Add `render(context)` to return a custom React element instead of the
+default pill. `onClick` makes the badge interactive.
+
+`members.getUserFromElement(element)` and `servers.getGuildFromElement(element)`
+read the React props associated with a member or guild row. Call
+`members.refresh()` / `servers.refresh()` after data changes that do not cause a
+React re-render.
+
+## Managed CSS and themes
+
+`plugin.styles` is created automatically for every renderer plugin and is
+cleared during `stop()`/hot reload:
+
+```js
+window.__reflux.pluginManager.register({
+  name: 'myPlugin',
+  start() {
+    this.styles.inject('layout', '.my-plugin { display: flex; }');
+
+    this.styles.registerTheme({
+      id: 'myPlugin-oled',
+      name: 'My Plugin OLED',
+      css: ':root { --background-primary: #000; }',
+      variables: {'--background-secondary': '#050505'},
+    });
+  },
+  stop() {},
+});
+
+// Activate/unregister themes through the global registry.
+const offTheme = window.__reflux.styles.forPlugin('myPlugin')
+  .registerTheme({id: 'myPlugin-oled', name: 'OLED', css: '/* … */'});
+window.__reflux.themes.activate('myPlugin-oled');
+```
+
+Theme activation persists in `localStorage` and sets
+`document.documentElement.dataset.refluxTheme`. `themes.deactivate()`,
+`themes.list()`, and `themes.active` are available globally. CSS inserted with
+`styles.inject()` is owned by the plugin and does not leak across plugins.
+
+## Hot reload
+
+Reflux watches each registered plugin directory for changes to `index.js` and
+`renderer-side.js`. After a short debounce it reloads the main module, restarts
+it, unregisters the old renderer instance, and injects the new renderer bundle.
+This is controlled by the `reflux.hotReload` setting (default `true`).
+
+```js
+// Request a reload manually from the renderer.
+await window.__reflux.pluginManager.reload('myPlugin');
+```
+
+For reload to re-inject your renderer code, reset your double-injection guard
+inside `stop()`. Imported single-file plugins are managed by the settings UI and
+are not covered by the directory watcher.
 
 ## Patching React components
 
@@ -383,6 +594,54 @@ await window.__reflux.patcher.ready;
 
 `patcher.ready` resolves once the cache is available, and
 `patcher.onReady(callback)` provides a callback form.
+
+### Lazy finders
+
+`findByProps()`/`findByCode()` only inspect modules that are already loaded. Use
+the lazy variants when a module may load later:
+
+```js
+const patcher = window.__reflux.patcher;
+
+// Resolves to exports, or null after the timeout (default 15 seconds).
+const messageStore = await patcher.findLazyByProps('getMessage', 'getMessages');
+const byCode = await patcher.findLazyByCode('MESSAGE_CREATE', 'getChannel');
+const byName = await patcher.findLazyByName('MessageContent');
+
+// Lower-level form returns {id, exports} or null.
+const match = await patcher.waitForModule((exports) => Boolean(exports?.getMessage));
+```
+
+The lazy finders combine a module-load hook with polling, so they work whether
+the module arrived before or after your plugin started. They accept an options
+object with `timeout` and `interval`.
+
+### Per-plugin patch registry
+
+Use a patch registry so every patch is removed together when a plugin stops:
+
+```js
+const patches = window.__reflux.patcher.createRegistry('myPlugin');
+
+patches.patch(
+  (exports) => typeof exports?.getMessage === 'function',
+  (exports) => { /* modify */ },
+);
+
+// Apply immediately to matching modules and keep watching for future loads.
+patches.patchLoaded(
+  (exports) => Boolean(exports?.getMessage),
+  (exports) => { /* modify once per exports object */ },
+);
+
+patches.after(someStore, 'getMessage', (args, result) => result);
+patches.dispose(); // remove every patch registered above
+```
+
+A plugin registered through `pluginManager.register()` receives
+`this.patches` automatically; it is disposed during `stop()`/hot reload. The
+registry also exposes `findModules`, `findByProps`, `findByCode`, `findLazy*`,
+`before`, `after`, `instead`, `patchReactComponent`, and `unpatchAll`.
 
 For patching methods on a module or object, use `before`, `after`, or `instead`.
 Each returns an unpatch function and should be cleaned up from the plugin's
@@ -577,6 +836,35 @@ await window.refluxBridge.clearPluginData('myPlugin');
 Plugin names are sanitised before they are used as filenames. Data written here
 is separate from settings and is never loaded automatically; your plugin decides
 when to call `readPluginData()`.
+
+### DataStore
+
+`DataStore` is a synchronous, persistent key/value store backed by
+`localStorage`. It is convenient for small state that needs to be available
+immediately on renderer startup.
+
+```js
+const {data} = window.__reflux;
+const store = data.createStore('myPlugin');
+
+store.set('lastChannel', '123456789');
+console.log(store.get('lastChannel')); // "123456789"
+console.log(store.get('missing', 42));  // 42
+
+store.update('count', (value = 0) => value + 1);
+store.subscribe((key, value) => console.log('changed', key, value));
+
+store.delete('lastChannel');
+store.clear();
+```
+
+`createStore(name)` reuses an existing instance with the same name. The store
+also exposes `has`, `keys`, `values`, `entries`, `size`, `toJSON`, `merge`, and
+returns an unsubscribe function from `subscribe`. A plugin registered through
+`pluginManager.register()` gets `this.dataStore` automatically.
+
+Use `plugin-data/*.json` through the bridge for larger or less frequent writes;
+use `DataStore` for small renderer state. Neither is synced between devices.
 
 ---
 

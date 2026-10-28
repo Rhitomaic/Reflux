@@ -20,6 +20,11 @@
 - `definePlugin()` with typed settings schemas, reactive per-plugin settings stores, and schema-driven settings controls
 - Lazy React/ReactDOM discovery, a Fluxer component kit, and an ErrorBoundary for plugin UI
 - `contextBridge` IPC bridge exposing settings, plugin management, and plugin-owned data to the renderer
+- Per-plugin native IPC with renderer → main calls, main → renderer events, and request/response handlers
+- Chat-bar and message-action buttons plus user-badge, member-list, and server-list hooks
+- `DataStore` for synchronous per-plugin state, lazy module finders, and per-plugin patch registries
+- Managed plugin CSS and themes, including persistent theme activation
+- Automatic plugin hot reload from `index.js` / `renderer-side.js` changes (disable with `reflux.hotReload`)
 - Gateway WebSocket interception for event hooks
 - Injected **Reflux** section inside Fluxer's native settings panel, including per-plugin settings
 - Import custom `.js` plugins at runtime with `==RefluxPlugin==` metadata blocks

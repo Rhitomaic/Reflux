@@ -39,6 +39,8 @@
  * 7. patch(filter, cb)                — arbitrary filter on exports object
  * 8. before/after/instead(...)        — patch a method on a known object
  * 9. findModules(filter)              — search already-loaded module cache
+ * 10. findLazyByProps/Code/Name(...)  — wait for modules that load later
+ * 11. createRegistry(owner)           — track and remove a plugin's patches
  *
  * These helpers are available on window.__reflux.patcher after renderer.js runs.
  *
@@ -105,8 +107,34 @@ function after(target, method, callback)      { return getPatcher().after(target
 /** @see {import('../renderer').Patcher.instead} */
 function instead(target, method, callback)    { return getPatcher().instead(target, method, callback); }
 
+/** Wait for a matching module and return `{id, exports}` or null. */
+function waitForModule(filter, options)       { return getPatcher().waitForModule(filter, options); }
+
+/** Wait for a matching module and return its exports or null. */
+function findLazy(filter, options)            { return getPatcher().findLazy(filter, options); }
+
+/** Wait for a module whose exports include every supplied property. */
+function findLazyByProps(...props)            { return getPatcher().findLazyByProps(...props); }
+
+/** Wait for a nested export whose value includes every supplied property. */
+function findLazyByPropsDeep(...props)        { return getPatcher().findLazyByPropsDeep(...props); }
+
+/** Wait for a function/component with this name or displayName. */
+function findLazyByName(name)                 { return getPatcher().findLazyByName(name); }
+
+/** Wait for a module whose factory source contains every snippet. */
+function findLazyByCode(...snippets)          { return getPatcher().findLazyByCode(...snippets); }
+
+/** Create a registry that tracks every patch for one plugin/owner. */
+function createRegistry(owner)                { return getPatcher().createRegistry(owner); }
+
+/** Alias for createRegistry(). */
+function registry(owner)                      { return getPatcher().registry(owner); }
+
 module.exports = {
   patch, patchByExportKey, findByProps, findByName, findByCode,
   patchByDisplayName, patchReactComponent, findModules,
-  before, after, instead, getPatcher,
+  before, after, instead, waitForModule, findLazy, findLazyByProps,
+  findLazyByPropsDeep, findLazyByName, findLazyByCode, createRegistry,
+  registry, getPatcher,
 };
