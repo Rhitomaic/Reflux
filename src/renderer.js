@@ -617,6 +617,19 @@
     },
 
     /**
+     * Find the first already-loaded module containing a nested export with all
+     * of the given properties. Fluxer commonly exposes store singletons as
+     * `exports.A`, `exports.default`, etc., so the shallow `findByProps()`
+     * helper is not enough for stores and managers.
+     *
+     * @param {...string} props
+     * @returns {any|null}
+     */
+    findByPropsDeep(...props) {
+      return _firstNestedExport((value) => _hasProps(value, props))?.value ?? null;
+    },
+
+    /**
      * Find the first already-loaded function export by name or displayName.
      * @param {string} name
      * @returns {Function|null}
@@ -777,7 +790,381 @@
     };
   }
 
+  // ---------------------------------------------------------------------------
+  // Flux / gateway event bus and store discovery
+  // ---------------------------------------------------------------------------
+
+  const GATEWAY_PATCH = Symbol('refluxGatewayPatch');
+
+  /** @type {Map<string, Set<Function>>} */
+  const _gatewayBeforeListeners = new Map();
+  /** @type {Map<string, Set<Function>>} */
+  const _gatewayAfterListeners = new Map();
+  /** @type {Set<object>} */
+  const _gatewayInstances = new Set();
+
+  let _gatewaySettled = false;
+  let _resolveGatewayReady = null;
+  const _gatewayReady = new Promise((resolve) => { _resolveGatewayReady = resolve; });
+  let _lastGatewayEvent = null;
+  let _gatewayScanTimer = null;
+
+  /**
+   * Return a module export and its immediate values (exports.A, exports.default,
+   * etc.). Stores and singletons usually live one level below the namespace.
+   * Property getters are deliberately not invoked.
+   */
+  function _nestedExportValues(exports) {
+    const values = [];
+    const seen = new Set();
+    const add = (value) => {
+      if (!value || (typeof value !== 'object' && typeof value !== 'function') || seen.has(value)) return;
+      seen.add(value);
+      values.push(value);
+    };
+
+    add(exports);
+    if (!exports || (typeof exports !== 'object' && typeof exports !== 'function')) return values;
+
+    let keys = [];
+    try { keys = Reflect.ownKeys(exports); } catch { /* exotic proxies */ }
+    for (const key of keys) {
+      let descriptor;
+      try { descriptor = Object.getOwnPropertyDescriptor(exports, key); } catch { continue; }
+      if (descriptor && Object.prototype.hasOwnProperty.call(descriptor, 'value')) add(descriptor.value);
+    }
+    return values;
+  }
+
+  function _hasProps(value, props) {
+    if (!value || (typeof value !== 'object' && typeof value !== 'function')) return false;
+    try { return props.every((prop) => prop in value); } catch { return false; }
+  }
+
+  function _firstNestedExport(predicate) {
+    for (const match of patcher.findModules(() => true)) {
+      for (const value of _nestedExportValues(match.exports)) {
+        try {
+          if (predicate(value, match.exports, match.id)) {
+            return {id: match.id, exports: match.exports, value};
+          }
+        } catch { /* ignore hostile getters and proxies */ }
+      }
+    }
+    return null;
+  }
+
+  const STORE_MATCHERS = {
+    messages(value) {
+      return typeof value?.getMessage === 'function' &&
+        (typeof value.getMessages === 'function' ||
+         typeof value.handleMessageDelete === 'function' ||
+         typeof value.handleMessageUpdate === 'function');
+    },
+    channels(value) {
+      return typeof value?.getChannel === 'function' &&
+        (typeof value.hasChannel === 'function' ||
+         typeof value.getChannelId === 'function' ||
+         typeof value.getChannelIds === 'function' ||
+         typeof value.getChannelMessages === 'function' ||
+         typeof value.getGuildChannels === 'function' ||
+         typeof value.getChannels === 'function');
+    },
+    users(value) {
+      return typeof value?.getUser === 'function';
+    },
+    guilds(value) {
+      return typeof value?.getGuild === 'function';
+    },
+  };
+
+  const STORE_ALIASES = new Map([
+    ['message', 'messages'],
+    ['messageStore', 'messages'],
+    ['channel', 'channels'],
+    ['channelStore', 'channels'],
+    ['user', 'users'],
+    ['userStore', 'users'],
+    ['guild', 'guilds'],
+    ['guildStore', 'guilds'],
+  ]);
+
+  /** @type {Map<string, object>} */
+  const _registeredStores = new Map();
+  /** @type {Map<string, object>} */
+  const _storeCache = new Map();
+
+  function _resolveStoreName(name) {
+    const key = String(name ?? '');
+    return STORE_ALIASES.get(key) ?? key;
+  }
+
+  function findStore(nameOrPredicate) {
+    if (typeof nameOrPredicate === 'string') {
+      const name = _resolveStoreName(nameOrPredicate);
+      if (_registeredStores.has(name)) return _registeredStores.get(name);
+      if (_storeCache.has(name)) {
+        const cached = _storeCache.get(name);
+        if (cached && (!STORE_MATCHERS[name] || STORE_MATCHERS[name](cached))) return cached;
+        _storeCache.delete(name);
+      }
+      const matcher = STORE_MATCHERS[name];
+      if (!matcher) return null;
+      const found = _firstNestedExport((value) => matcher(value));
+      if (found?.value) _storeCache.set(name, found.value);
+      return found?.value ?? null;
+    }
+
+    if (typeof nameOrPredicate !== 'function') return null;
+    for (const match of patcher.findModules(() => true)) {
+      for (const value of _nestedExportValues(match.exports)) {
+        try {
+          if (nameOrPredicate(value)) return value;
+        } catch { /* ignore */ }
+      }
+    }
+    return null;
+  }
+
+  function registerStore(name, store) {
+    if (!name || !store) throw new Error('registerStore() requires a name and a store object.');
+    const key = _resolveStoreName(name);
+    _registeredStores.set(key, store);
+    _storeCache.set(key, store);
+    return () => {
+      if (_registeredStores.get(key) === store) _registeredStores.delete(key);
+      if (_storeCache.get(key) === store) _storeCache.delete(key);
+    };
+  }
+
+  function waitForStore(nameOrPredicate, {timeout = 15000, interval = 250} = {}) {
+    const existing = findStore(nameOrPredicate);
+    if (existing) return Promise.resolve(existing);
+    return new Promise((resolve) => {
+      const started = Date.now();
+      const timer = setInterval(() => {
+        const found = findStore(nameOrPredicate);
+        if (found || (timeout > 0 && Date.now() - started >= timeout)) {
+          clearInterval(timer);
+          resolve(found ?? null);
+        }
+      }, Math.max(50, interval));
+    });
+  }
+
+  function subscribeToStore(store, listener) {
+    if (!store || typeof listener !== 'function') return () => {};
+    const bind = (method, removeMethod) => {
+      if (typeof store[method] !== 'function') return null;
+      const result = store[method](listener);
+      if (typeof result === 'function') return result;
+      if (removeMethod && typeof store[removeMethod] === 'function') {
+        return () => store[removeMethod](listener);
+      }
+      return () => {};
+    };
+
+    const direct = bind('subscribe') || bind('addChangeListener', 'removeChangeListener') ||
+      bind('addListener', 'removeListener');
+    if (direct) return direct;
+
+    // MobX stores expose observe(), but it is less uniform than a listener API.
+    if (typeof store.observe === 'function') {
+      try {
+        const disposal = store.observe(() => listener());
+        if (typeof disposal === 'function') return disposal;
+        if (typeof disposal?.dispose === 'function') return () => disposal.dispose();
+      } catch { /* not a MobX observable */ }
+    }
+    return () => {};
+  }
+
+  function _gatewayEventMeta(socket, event) {
+    const type = event?.type ?? event?.t ?? null;
+    const data = event?.data ?? event?.d ?? event ?? null;
+    return {type, data, event, socket, at: Date.now()};
+  }
+
+  function _callGatewayListeners(map, type, data, meta) {
+    const exact = map.get(type);
+    if (exact) {
+      for (const listener of Array.from(exact)) {
+        try { listener(data, meta); }
+        catch (err) { console.error(`[Reflux:Flux] Gateway "${type}" listener threw:`, err); }
+      }
+    }
+    const wildcard = map.get('*');
+    if (wildcard) {
+      for (const listener of Array.from(wildcard)) {
+        try { listener(type, data, meta); }
+        catch (err) { console.error('[Reflux:Flux] Gateway wildcard listener threw:', err); }
+      }
+    }
+  }
+
+  function _emitGateway(phase, meta) {
+    _lastGatewayEvent = {...meta, phase};
+    _callGatewayListeners(
+      phase === 'after' ? _gatewayAfterListeners : _gatewayBeforeListeners,
+      meta.type,
+      meta.data,
+      meta,
+    );
+    events.emit(phase === 'after' ? 'gateway-after' : 'gateway-before', meta);
+    events.emit('gateway', {...meta, phase});
+  }
+
+  function _markGatewayReady() {
+    if (_gatewaySettled) return;
+    _gatewaySettled = true;
+    _resolveGatewayReady?.(gateway);
+    events.emit('gateway-ready', gateway);
+  }
+
+  function _patchGatewayInstance(instance) {
+    if (!instance) return false;
+    let target = instance;
+    let original = instance.handleGatewayDispatch;
+    if (typeof original !== 'function') return false;
+
+    // Some Fluxer builds keep the method on the prototype. Patching the
+    // prototype once is enough and avoids creating a property on every
+    // per-account gateway instance.
+    if (!Object.prototype.hasOwnProperty.call(instance, 'handleGatewayDispatch')) {
+      const proto = Object.getPrototypeOf(instance);
+      if (proto && typeof proto.handleGatewayDispatch === 'function') target = proto;
+    }
+
+    if (target[GATEWAY_PATCH]) {
+      _gatewayInstances.add(instance);
+      return false;
+    }
+
+    original = target.handleGatewayDispatch;
+    const patched = function refluxGatewayDispatch(socket, event, ...rest) {
+      const meta = _gatewayEventMeta(socket, event);
+      _emitGateway('before', meta);
+      try {
+        return original.call(this, socket, event, ...rest);
+      } finally {
+        _emitGateway('after', meta);
+      }
+    };
+
+    try {
+      Object.defineProperty(target, GATEWAY_PATCH, {value: patched, configurable: true});
+      target.handleGatewayDispatch = patched;
+    } catch (err) {
+      console.warn('[Reflux:Flux] Could not patch gateway dispatch:', err);
+      return false;
+    }
+
+    _gatewayInstances.add(instance);
+    _markGatewayReady();
+    console.log('[Reflux:Flux] Gateway dispatch hook installed.');
+    return true;
+  }
+
+  function discoverGateway() {
+    const found = _firstNestedExport((value) => typeof value?.handleGatewayDispatch === 'function');
+    if (found?.value) _patchGatewayInstance(found.value);
+    return found?.value ?? null;
+  }
+
+  function _gatewayOn(map, event, listener) {
+    if (typeof listener !== 'function') return () => {};
+    const key = String(event || '*');
+    if (!map.has(key)) map.set(key, new Set());
+    map.get(key).add(listener);
+    return () => map.get(key)?.delete(listener);
+  }
+
+  const gateway = {
+    /** Fires before Fluxer processes a gateway event. */
+    on(event, listener) { return _gatewayOn(_gatewayBeforeListeners, event, listener); },
+    /** Fires after Fluxer has processed a gateway event. */
+    after(event, listener) { return _gatewayOn(_gatewayAfterListeners, event, listener); },
+    onAny(listener) { return _gatewayOn(_gatewayBeforeListeners, '*', listener); },
+    once(event, listener) {
+      const off = this.on(event, (data, meta) => {
+        off();
+        listener(data, meta);
+      });
+      return off;
+    },
+    ready: _gatewayReady,
+    get patched() { return _gatewaySettled; },
+    get instances() { return Array.from(_gatewayInstances); },
+    get lastEvent() { return _lastGatewayEvent; },
+    discover: discoverGateway,
+  };
+
+  const flux = {
+    gateway,
+
+    /** Subscribe to a gateway event before Fluxer handles it. */
+    on(event, listener) { return gateway.on(event, listener); },
+    /** Subscribe to a gateway event after Fluxer has handled it. */
+    after(event, listener) { return gateway.after(event, listener); },
+    onAny(listener) { return gateway.onAny(listener); },
+    once(event, listener) { return gateway.once(event, listener); },
+
+    findStore,
+    getStore(name) { return findStore(name); },
+    waitForStore,
+    registerStore,
+    subscribe: subscribeToStore,
+
+    /** Publish a plugin-local event on the shared Reflux event bus. */
+    emit(event, data) {
+      events.emit(`flux:${event}`, data);
+      events.emit('flux', event, data);
+    },
+
+    get messageStore() { return findStore('messages'); },
+    get channelStore() { return findStore('channels'); },
+    get userStore() { return findStore('users'); },
+    get guildStore() { return findStore('guilds'); },
+
+    useStore(store, selector) {
+      const React = _react;
+      if (!React?.useReducer || !React?.useEffect) {
+        throw new Error('flux.useStore() requires __reflux.react.ready to resolve first.');
+      }
+      const [, forceUpdate] = React.useReducer((value) => value + 1, 0);
+      React.useEffect(() => subscribeToStore(store, forceUpdate), [store]);
+      return typeof selector === 'function' ? selector(store) : store;
+    },
+  };
+
+  const stores = {
+    get messages() { return findStore('messages'); },
+    get channels() { return findStore('channels'); },
+    get users() { return findStore('users'); },
+    get guilds() { return findStore('guilds'); },
+    find: findStore,
+    get: findStore,
+    waitFor: waitForStore,
+    register: registerStore,
+  };
+
+  onWebpackReady(() => {
+    if (discoverGateway()) return;
+    // Stores can be instantiated lazily after their defining module loads, so
+    // keep a low-frequency scan running until the gateway is discovered.
+    _gatewayScanTimer = setInterval(() => {
+      if (discoverGateway() && _gatewayScanTimer) {
+        clearInterval(_gatewayScanTimer);
+        _gatewayScanTimer = null;
+      }
+    }, 3000);
+  });
+
+  // Also try immediately in case webpack was captured before this section ran.
+  discoverGateway();
+
   let _uiNavigationInProgress = false;
+
 
   // ---------------------------------------------------------------------------
   // React + Fluxer component kit
@@ -1545,6 +1932,9 @@
     contextMenu,
     pluginManager,
     events,
+    flux,
+    gateway,
+    stores,
     settings,
     definePlugin,
     OptionType,
