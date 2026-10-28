@@ -285,6 +285,152 @@
     },
   };
 
+  // ---------------------------------------------------------------------------
+  // DataStore (persistent per-plugin key/value state)
+  // ---------------------------------------------------------------------------
+
+  const DATA_STORE_PREFIX = 'reflux:data:';
+  const _dataStoreMemory = new Map();
+  const _dataStoreCache = new Map();
+
+  function _dataStoreKey(name) {
+    return `${DATA_STORE_PREFIX}${String(name ?? 'default')}`;
+  }
+
+  function _readDataStoreValue(name) {
+    const key = _dataStoreKey(name);
+    try {
+      const raw = window.localStorage?.getItem(key);
+      if (raw != null) return JSON.parse(raw);
+    } catch (err) {
+      console.warn(`[Reflux:DataStore] Could not read "${name}" from localStorage:`, err);
+    }
+    return _dataStoreMemory.get(key) ?? {};
+  }
+
+  function _writeDataStoreValue(name, data) {
+    const key = _dataStoreKey(name);
+    _dataStoreMemory.set(key, data);
+    try {
+      if (Object.keys(data).length) window.localStorage?.setItem(key, JSON.stringify(data));
+      else window.localStorage?.removeItem(key);
+    } catch (err) {
+      console.warn(`[Reflux:DataStore] Could not persist "${name}":`, err);
+    }
+  }
+
+  class RefluxDataStore {
+    constructor(name = 'default') {
+      this.name = String(name || 'default');
+      this._listeners = new Set();
+      this._data = _readDataStoreValue(this.name);
+      if (!this._data || typeof this._data !== 'object' || Array.isArray(this._data)) {
+        this._data = {};
+      }
+      _dataStoreCache.set(this.name, this);
+    }
+
+    _notify(key, value) {
+      for (const listener of Array.from(this._listeners)) {
+        try { listener(key, value, this); }
+        catch (err) { console.error(`[Reflux:DataStore] "${this.name}" listener threw:`, err); }
+      }
+    }
+
+    _save() {
+      _writeDataStoreValue(this.name, this._data);
+    }
+
+    get(key, defaultValue = undefined) {
+      return Object.prototype.hasOwnProperty.call(this._data, key)
+        ? this._data[key]
+        : defaultValue;
+    }
+
+    set(key, value) {
+      if (value === undefined) {
+        this.delete(key);
+        return undefined;
+      }
+      this._data[key] = value;
+      this._save();
+      this._notify(key, value);
+      return value;
+    }
+
+    has(key) {
+      return Object.prototype.hasOwnProperty.call(this._data, key);
+    }
+
+    delete(key) {
+      if (!this.has(key)) return false;
+      delete this._data[key];
+      this._save();
+      this._notify(key, undefined);
+      return true;
+    }
+
+    clear() {
+      this._data = {};
+      this._save();
+      this._notify(null, undefined);
+    }
+
+    keys() { return Object.keys(this._data); }
+    values() { return Object.values(this._data); }
+    entries() { return Object.entries(this._data); }
+
+    get size() { return Object.keys(this._data).length; }
+
+    toJSON() { return {...this._data}; }
+
+    update(key, updater) {
+      if (typeof updater !== 'function') throw new Error('DataStore.update() requires a function.');
+      const next = updater(this.get(key));
+      return this.set(key, next);
+    }
+
+    merge(values) {
+      if (!values || typeof values !== 'object' || Array.isArray(values)) return this;
+      Object.assign(this._data, values);
+      this._save();
+      for (const [key, value] of Object.entries(values)) this._notify(key, value);
+      return this;
+    }
+
+    subscribe(listener) {
+      if (typeof listener !== 'function') return () => {};
+      this._listeners.add(listener);
+      return () => this._listeners.delete(listener);
+    }
+  }
+
+  const data = {
+    DataStore: RefluxDataStore,
+    createStore(name, {reuse = true} = {}) {
+      const key = String(name || 'default');
+      if (reuse && _dataStoreCache.has(key)) return _dataStoreCache.get(key);
+      return new RefluxDataStore(key);
+    },
+    getStore(name) { return this.createStore(name); },
+    removeStore(name) {
+      const key = String(name || 'default');
+      _dataStoreCache.delete(key);
+      _dataStoreMemory.delete(_dataStoreKey(key));
+      try { window.localStorage?.removeItem(_dataStoreKey(key)); } catch { /* ignore */ }
+    },
+    names() {
+      const names = new Set(_dataStoreCache.keys());
+      try {
+        for (let i = 0; i < (window.localStorage?.length ?? 0); i++) {
+          const key = window.localStorage.key(i);
+          if (key?.startsWith(DATA_STORE_PREFIX)) names.add(key.slice(DATA_STORE_PREFIX.length));
+        }
+      } catch { /* localStorage unavailable */ }
+      return Array.from(names);
+    },
+  };
+
   /**
    * Normalize a plugin definition and automatically create its settings store.
    * Renderer plugins can use this the same way main-process plugins use
@@ -773,6 +919,115 @@
       return result;
     },
 
+    /**
+     * Wait for a module matching `filter` to load. Resolves to
+     * `{id, exports}` or `null` after the timeout.
+     */
+    waitForModule(filter, options) {
+      return _waitForModule(filter, options);
+    },
+
+    /** Wait for a module and resolve to its exports. */
+    findLazy(filter, options) {
+      return _waitForModule(filter, options).then((match) => match?.exports ?? null);
+    },
+
+    findLazyByProps(...props) {
+      return this.findLazy((exports) => _hasProps(exports, props));
+    },
+
+    findLazyByPropsDeep(...props) {
+      return this.findLazy((exports) => _nestedExportValues(exports).some((value) => _hasProps(value, props)));
+    },
+
+    findLazyByName(name) {
+      return this.findLazy((exports) => {
+        const isMatch = (value) => value && (value.displayName === name || value.name === name);
+        return isMatch(exports) || (exports && typeof exports === 'object' && Object.values(exports).some(isMatch));
+      });
+    },
+
+    findLazyByCode(...snippets) {
+      return this.findLazy((_exports, id) => _moduleSourceMatches(id, snippets));
+    },
+
+    /**
+     * Create a per-plugin patch registry. Every patch registered through the
+     * registry is tracked and can be removed in one call during stop/reload.
+     */
+    createRegistry(owner = 'plugin') {
+      const disposers = new Set();
+      const track = (disposer) => {
+        if (typeof disposer === 'function') disposers.add(disposer);
+        return disposer;
+      };
+      const registry = {
+        owner,
+        get size() { return disposers.size; },
+        track,
+        patch(filter, callback) {
+          return track(patcher.patch(filter, callback));
+        },
+        patchLoaded(filter, callback) {
+          const seen = new WeakSet();
+          const apply = (exports, id) => {
+            if (exports && (typeof exports === 'object' || typeof exports === 'function')) {
+              if (seen.has(exports)) return exports;
+              seen.add(exports);
+            }
+            return callback(exports, id);
+          };
+          for (const match of patcher.findModules(filter)) {
+            try { apply(match.exports, match.id); }
+            catch (err) { console.error(`[Reflux:Patcher] Loaded patch for "${owner}" threw:`, err); }
+          }
+          return track(patcher.patch(filter, apply));
+        },
+        patchByExportKey(key, callback) {
+          return track(patcher.patchByExportKey(key, callback));
+        },
+        patchByDisplayName(name, callback) {
+          return track(patcher.patchByDisplayName(name, callback));
+        },
+        patchReactComponent(name, callback) {
+          return track(patcher.patchReactComponent(name, callback));
+        },
+        before(target, method, callback) {
+          return track(patcher.before(target, method, callback));
+        },
+        after(target, method, callback) {
+          return track(patcher.after(target, method, callback));
+        },
+        instead(target, method, callback) {
+          return track(patcher.instead(target, method, callback));
+        },
+        findModules(filter) { return patcher.findModules(filter); },
+        findByProps(...props) { return patcher.findByProps(...props); },
+        findByPropsDeep(...props) { return patcher.findByPropsDeep(...props); },
+        findByName(name) { return patcher.findByName(name); },
+        findByCode(...snippets) { return patcher.findByCode(...snippets); },
+        waitForModule(filter, options) { return patcher.waitForModule(filter, options); },
+        findLazy(filter, options) { return patcher.findLazy(filter, options); },
+        findLazyByProps(...props) { return patcher.findLazyByProps(...props); },
+        findLazyByPropsDeep(...props) { return patcher.findLazyByPropsDeep(...props); },
+        findLazyByName(name) { return patcher.findLazyByName(name); },
+        findLazyByCode(...snippets) { return patcher.findLazyByCode(...snippets); },
+        unpatchAll() {
+          for (const disposer of Array.from(disposers).reverse()) {
+            try { disposer(); }
+            catch (err) { console.error(`[Reflux:Patcher] Unpatch for "${owner}" threw:`, err); }
+          }
+          disposers.clear();
+        },
+        dispose() { this.unpatchAll(); },
+      };
+      return registry;
+    },
+
+    registry(owner) {
+      return this.createRegistry(owner);
+    },
+
     events,
     ready: _webpackReady,
     onReady: onWebpackReady,
@@ -788,6 +1043,50 @@
     return () => {
       if (target[method] === patched) target[method] = original;
     };
+  }
+
+  function _moduleSourceMatches(id, snippets) {
+    if (!_webpackRequire?.m) return false;
+    const factory = _webpackRequire.m[id];
+    if (typeof factory !== 'function') return false;
+    let source;
+    try { source = Function.prototype.toString.call(factory); }
+    catch { return false; }
+    return snippets.every((snippet) => source.includes(snippet));
+  }
+
+  function _waitForModule(filter, {timeout = 15000, interval = 250} = {}) {
+    const findNow = () => patcher.findModules(filter)[0] ?? null;
+    const existing = findNow();
+    if (existing) return Promise.resolve(existing);
+
+    return new Promise((resolve) => {
+      let settled = false;
+      let polling = null;
+      let unpatch = null;
+      let timer = null;
+
+      const finish = (match) => {
+        if (settled) return;
+        settled = true;
+        try { unpatch?.(); } catch { /* already removed */ }
+        if (polling) clearInterval(polling);
+        if (timer) clearTimeout(timer);
+        resolve(match);
+      };
+
+      // Both callbacks are used: the patcher catches future module loads, while
+      // polling covers modules whose exports were replaced without a cache miss.
+      unpatch = patcher.patch(filter, (exports, id) => {
+        finish({id, exports});
+        return exports;
+      });
+      polling = setInterval(() => {
+        const match = findNow();
+        if (match) finish(match);
+      }, Math.max(50, interval));
+      if (timeout > 0) timer = setTimeout(() => finish(findNow()), timeout);
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -1462,6 +1761,180 @@
     }
   }, 15000);
 
+  // ---------------------------------------------------------------------------
+  // Managed CSS and themes
+  // ---------------------------------------------------------------------------
+
+  const _managedStyles = new Map();
+  const _registeredThemes = new Map();
+  const THEME_STORAGE_KEY = 'reflux:active-theme';
+  let _activeThemeId = null;
+
+  function _styleToken(value) {
+    return String(value ?? '')
+      .trim()
+      .replace(/[^a-z0-9._-]+/gi, '-')
+      .replace(/^-+|-+$/g, '') || 'default';
+  }
+
+  function _styleKey(owner, id) {
+    return `${owner ?? 'global'}\u0000${id}`;
+  }
+
+  function _injectManagedStyle(owner, id, css, {kind = 'css'} = {}) {
+    const ownerKey = String(owner ?? 'global');
+    const styleId = String(id ?? 'style');
+    const key = _styleKey(ownerKey, styleId);
+    let entry = _managedStyles.get(key);
+    if (!entry) {
+      const element = document.createElement('style');
+      element.id = `reflux-style-${_styleToken(ownerKey)}-${_styleToken(styleId)}`;
+      element.dataset.refluxStyle = styleId;
+      element.dataset.refluxOwner = ownerKey;
+      element.dataset.refluxKind = kind;
+      document.head.appendChild(element);
+      entry = {key, owner: ownerKey, id: styleId, element, kind, css: ''};
+      _managedStyles.set(key, entry);
+    }
+    entry.css = String(css ?? '');
+    entry.element.textContent = entry.css;
+
+    return () => {
+      if (_managedStyles.get(key) !== entry) return;
+      _managedStyles.delete(key);
+      entry.element.remove();
+    };
+  }
+
+  function _removeManagedStyle(owner, id) {
+    const key = _styleKey(owner, id);
+    const entry = _managedStyles.get(key);
+    if (!entry) return false;
+    _managedStyles.delete(key);
+    entry.element.remove();
+    return true;
+  }
+
+  const themes = {
+    register(theme) {
+      if (!theme || !theme.id) throw new Error('themes.register() requires an id.');
+      const id = String(theme.id);
+      const entry = {
+        id,
+        name: String(theme.name ?? id),
+        description: String(theme.description ?? ''),
+        css: String(theme.css ?? ''),
+        variables: theme.variables && typeof theme.variables === 'object' ? {...theme.variables} : null,
+        owner: theme.owner ? String(theme.owner) : null,
+        dark: theme.dark,
+        raw: theme,
+      };
+      _registeredThemes.set(id, entry);
+      if (_activeThemeId === id) _applyTheme(entry);
+      else if (!_activeThemeId) {
+        try {
+          const saved = window.localStorage?.getItem(THEME_STORAGE_KEY);
+          if (saved === id) {
+            _activeThemeId = id;
+            _applyTheme(entry);
+          }
+        } catch { /* localStorage unavailable */ }
+      }
+      return () => {
+        if (_registeredThemes.get(id) !== entry) return;
+        themes.unregister(id);
+      };
+    },
+    unregister(id) {
+      const key = String(id);
+      const entry = _registeredThemes.get(key);
+      if (!entry) return false;
+      _registeredThemes.delete(key);
+      if (_activeThemeId === key) _deactivateTheme({clearSaved: false});
+      return true;
+    },
+    activate(id) {
+      const key = String(id);
+      const entry = _registeredThemes.get(key);
+      if (!entry) return false;
+      _activeThemeId = key;
+      _applyTheme(entry);
+      try { window.localStorage?.setItem(THEME_STORAGE_KEY, key); } catch { /* ignore */ }
+      try { window.refluxBridge?.setSetting?.('reflux.theme', key); } catch { /* ignore */ }
+      events.emit('theme-changed', key, entry);
+      return true;
+    },
+    deactivate() {
+      _deactivateTheme({clearSaved: true});
+    },
+    get active() { return _activeThemeId ? (_registeredThemes.get(_activeThemeId) ?? null) : null; },
+    get activeId() { return _activeThemeId; },
+    list() { return Array.from(_registeredThemes.values()); },
+    get(id) { return _registeredThemes.get(String(id)) ?? null; },
+    has(id) { return _registeredThemes.has(String(id)); },
+  };
+
+  function _deactivateTheme({clearSaved = true} = {}) {
+    _activeThemeId = null;
+    _removeManagedStyle('reflux', 'active-theme');
+    try { delete document.documentElement.dataset.refluxTheme; } catch { /* ignore */ }
+    if (clearSaved) {
+      try { window.localStorage?.removeItem(THEME_STORAGE_KEY); } catch { /* ignore */ }
+      try { window.refluxBridge?.setSetting?.('reflux.theme', null); } catch { /* ignore */ }
+    }
+    events.emit('theme-changed', null, null);
+  }
+
+  function _applyTheme(entry) {
+    const variables = entry.variables
+      ? Object.entries(entry.variables).map(([key, value]) => `  ${key.startsWith('--') ? key : `--${key}`}: ${value};`).join('\n')
+      : '';
+    const css = `${variables ? `:root {\n${variables}\n}\n` : ''}${entry.css}`;
+    _injectManagedStyle('reflux', 'active-theme', css, {kind: 'theme'});
+    try { document.documentElement.dataset.refluxTheme = entry.id; } catch { /* ignore */ }
+  }
+
+  const styles = {
+    inject(id, css, options = {}) {
+      const owner = options.owner ?? 'global';
+      const remove = _injectManagedStyle(owner, id, css, options);
+      return remove;
+    },
+    remove(id, owner = 'global') { return _removeManagedStyle(owner, id); },
+    clear(owner) {
+      const ownerKey = owner === undefined ? null : String(owner);
+      for (const entry of Array.from(_managedStyles.values())) {
+        if (ownerKey !== null && entry.owner !== ownerKey) continue;
+        _managedStyles.delete(entry.key);
+        entry.element.remove();
+      }
+      if (ownerKey !== null) {
+        for (const entry of Array.from(_registeredThemes.values())) {
+          if (entry.owner !== ownerKey) continue;
+          themes.unregister(entry.id);
+        }
+      }
+    },
+    has(id, owner = 'global') { return _managedStyles.has(_styleKey(owner, id)); },
+    list() {
+      return Array.from(_managedStyles.values()).map(({owner, id, kind, css}) => ({owner, id, kind, size: css.length}));
+    },
+    themes,
+    forPlugin(name) {
+      const owner = String(name ?? 'plugin');
+      return {
+        owner,
+        inject(id, css, options = {}) { return styles.inject(id, css, {...options, owner}); },
+        remove(id) { return styles.remove(id, owner); },
+        clear() { return styles.clear(owner); },
+        registerTheme(theme) { return themes.register({...theme, owner}); },
+        activateTheme(id) { return themes.activate(id); },
+        deactivateTheme() { return themes.deactivate(); },
+      };
+    },
+  };
+
+
   const ui = {
     find(selector, root = document) {
       return root?.querySelector?.(selector) ?? null;
@@ -1521,17 +1994,7 @@
     },
 
     injectCSS(id, cssText) {
-      const styleId = `reflux-style-${id}`;
-      let style = document.getElementById(styleId);
-      if (!style) {
-        style = document.createElement('style');
-        style.id = styleId;
-        document.head.appendChild(style);
-      }
-      style.textContent = String(cssText);
-      return () => {
-        if (style?.parentNode) style.remove();
-      };
+      return styles.inject(id, cssText, {owner: 'core'});
     },
 
     navigate(to, {replace = false, state = null} = {}) {
@@ -1852,7 +2315,7 @@
   }
 
   function _renderExtensionOutput(output, extension, context, container) {
-    if (!container?.isConnected) return;
+    if (!container) return;
     const React = _react;
 
     const looksLikeReactElement = output && typeof output === 'object' &&
@@ -2196,6 +2659,777 @@
   gateway.on('MESSAGE_BULK_DELETE', _handleBulkDelete);
 
   ensureMessageObserver();
+
+  // ---------------------------------------------------------------------------
+  // Chat-bar, message-popover, member-list and server-list hooks
+  // ---------------------------------------------------------------------------
+
+  const UI_HOOK_CSS = `
+    .reflux-chat-bar-actions,
+    .reflux-message-popover-actions {
+      display: flex;
+      align-items: center;
+      gap: .125rem;
+      flex: 0 0 auto;
+      min-width: 0;
+    }
+    .reflux-chat-bar-button,
+    .reflux-message-popover-button {
+      all: unset;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 2rem;
+      height: 2rem;
+      padding: 0;
+      border-radius: .375rem;
+      box-sizing: border-box;
+      color: var(--interactive-normal, var(--text-secondary, #b5bac1));
+      cursor: pointer;
+      transition: background-color .12s ease, color .12s ease, opacity .12s ease;
+    }
+    .reflux-chat-bar-button:hover,
+    .reflux-message-popover-button:hover,
+    .reflux-chat-bar-button:focus-visible,
+    .reflux-message-popover-button:focus-visible {
+      background: var(--background-modifier-hover, rgba(255,255,255,.06));
+      color: var(--interactive-hover, var(--text-primary, #fff));
+      outline: none;
+    }
+    .reflux-chat-bar-button[disabled],
+    .reflux-message-popover-button[disabled],
+    .reflux-chat-bar-button[aria-disabled="true"],
+    .reflux-message-popover-button[aria-disabled="true"] {
+      opacity: .45;
+      cursor: not-allowed;
+    }
+    .reflux-hook-icon {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 1.25rem;
+      height: 1.25rem;
+      flex: 0 0 auto;
+      line-height: 1;
+    }
+    .reflux-hook-icon > svg,
+    .reflux-hook-icon svg {
+      display: block;
+      width: 1.25rem;
+      height: 1.25rem;
+      fill: currentColor;
+    }
+    .reflux-hook-icon > img {
+      display: block;
+      width: 1.25rem;
+      height: 1.25rem;
+      object-fit: contain;
+    }
+    .reflux-hook-label {
+      min-width: 0;
+      overflow: hidden;
+      font-size: .75rem;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }
+    .reflux-member-badges,
+    .reflux-profile-badges {
+      display: inline-flex;
+      align-items: center;
+      gap: .25rem;
+      margin-left: .25rem;
+      vertical-align: middle;
+      flex-wrap: wrap;
+      min-width: 0;
+    }
+    .reflux-server-badges {
+      position: absolute;
+      right: -.125rem;
+      bottom: -.125rem;
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: .125rem;
+      max-width: calc(100% + .25rem);
+      pointer-events: none;
+      z-index: 2;
+    }
+    .reflux-server-badges > * {
+      pointer-events: auto;
+    }
+    .reflux-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: .1875rem;
+      min-height: 1.125rem;
+      padding: 0 .3125rem;
+      box-sizing: border-box;
+      border: 1px solid var(--background-modifier-accent, rgba(255,255,255,.08));
+      border-radius: 624.9375rem;
+      background: var(--background-secondary-lighter, rgba(255,255,255,.07));
+      color: var(--text-secondary, var(--text-muted, #b5bac1));
+      font-size: .625rem;
+      font-weight: 600;
+      line-height: 1;
+      white-space: nowrap;
+    }
+    .reflux-badge:empty {
+      display: none;
+    }
+    .reflux-badge .reflux-hook-icon {
+      width: .75rem;
+      height: .75rem;
+    }
+    .reflux-badge .reflux-hook-icon svg {
+      width: .75rem;
+      height: .75rem;
+    }
+    .reflux-badge .reflux-hook-icon > img {
+      width: .75rem;
+      height: .75rem;
+    }
+    .reflux-hook-decoration:empty {
+      display: none;
+    }
+  `;
+
+  const UI_HOOK_KINDS = {
+    'chat-bar': {
+      selectors: ['[data-flx="channel.textarea.textarea-buttons.button-container-dense"]'],
+      wrapperClass: 'reflux-chat-bar-actions',
+      placement: 'before-last',
+      buttonClass: 'reflux-chat-bar-button',
+      context(root) {
+        const props = _findFiberProps(root, (value) => value?.channel?.id || value?.channelId);
+        const channel = props?.channel ?? null;
+        return {
+          element: root,
+          channel,
+          channelId: channel?.id ?? props?.channelId ?? currentChannelId(),
+        };
+      },
+    },
+    'message-popover': {
+      selectors: ['[data-flx="channel.message-action-bar.message-action-bar-core.action-bar"]'],
+      wrapperClass: 'reflux-message-popover-actions',
+      placement: 'before-last',
+      buttonClass: 'reflux-message-popover-button',
+      context(root) {
+        const row = root.closest('[data-message-id]');
+        const props = _findFiberProps(root, (value) => value?.message?.id || value?.messageId);
+        const messageId = props?.message?.id ?? props?.messageId ?? row?.getAttribute('data-message-id') ?? '';
+        const channelId = props?.message?.channelId ?? props?.message?.channel_id ??
+          row?.getAttribute('data-channel-id') ?? currentChannelId();
+        const message = (props?.message && String(props.message.id) === String(messageId))
+          ? props.message
+          : (messageId ? getMessage(channelId, messageId) : null);
+        return {element: row ?? root, root, row, message, messageId, channelId};
+      },
+    },
+    'member-badge': {
+      selectors: [
+        '[data-flx="channel.member-list-item.name-container"]',
+        '[data-flx="channel.channel-details-bottom-sheet-member-list.mobile-member-list-item.member-name-row"]',
+      ],
+      wrapperClass: 'reflux-member-badges',
+      placement: 'append',
+      context(root) {
+        const row = root.closest('[data-flx="channel.member-list-item.button.context-menu"]')
+          ?? root.closest('[data-flx="channel.channel-details-bottom-sheet-member-list.mobile-member-list-item.member-list-item"]')
+          ?? root.closest('[data-flx="channel.channel-members.group-dm-member-list-group.member-list-item"]')
+          ?? root.closest('[data-flx*="member-list-item"]')
+          ?? root.closest('button')
+          ?? root;
+        const props = _findFiberProps(root, (value) => value?.user?.id || value?.userId) ??
+          _findFiberProps(row, (value) => value?.user?.id || value?.userId);
+        const user = props?.user ?? (props?.userId ? {id: props.userId} : null);
+        return {
+          element: row,
+          root,
+          user,
+          userId: user?.id ?? props?.userId ?? null,
+          guildId: props?.guildId ?? null,
+          channelId: props?.channelId ?? currentChannelId(),
+          member: props?.guildMember ?? props?.member ?? null,
+        };
+      },
+    },
+    'server-badge': {
+      selectors: ['[data-flx="app.sidebar-nav.guild-list-item-presentation.relative"]'],
+      wrapperClass: 'reflux-server-badges',
+      placement: 'append',
+      context(root) {
+        const row = root.closest('[data-guild-id]') ?? root.closest('[data-flx*="guild-list-item"]');
+        const props = _findFiberProps(root, (value) => value?.guild?.id) ??
+          _findFiberProps(row, (value) => value?.guild?.id);
+        const guildId = props?.guild?.id ?? row?.getAttribute('data-guild-id') ?? null;
+        let guild = props?.guild ?? null;
+        if (!guild) {
+          const store = findStore('guilds');
+          if (store && guildId) {
+            try { guild = store.getGuild(guildId) ?? null; }
+            catch { /* ignore */ }
+          }
+        }
+        return {element: row ?? root, root, guild, guildId };
+      },
+    },
+    'profile-badge': {
+      selectors: [
+        '[data-flx="app.floating.user-area-popout.user-profile-badges"]',
+        '[data-flx="user.user-profile-mobile-sheet.user-profile-mobile-sheet-content.user-profile-badges"]',
+        '[data-flx="user.user-profile-modal.user-info.user-profile-badges"]',
+        '[data-flx="user.user-profile-popout.user-profile-badges"]',
+        '[data-flx="user.profile.profile-preview.user-profile-badges"]',
+        '[data-flx="channel.direct-message.dm-welcome-section.user-profile-badges"]',
+        '[data-flx="app.you-page.user-profile-badges"]',
+      ],
+      wrapperClass: 'reflux-profile-badges',
+      placement: 'append',
+      context(root) {
+        const props = _findFiberProps(root, (value) =>
+          value?.user?.id || value?.profile?.user?.id || value?.userId);
+        const user = props?.user ?? props?.profile?.user ?? (props?.userId ? {id: props.userId} : null);
+        return {
+          element: root,
+          root,
+          user,
+          userId: user?.id ?? props?.userId ?? null,
+          profile: props?.profile ?? null,
+        };
+      },
+    },
+  };
+
+  /** @type {Map<string, object>} */
+  const _uiHooks = new Map();
+  /** @type {Map<Element, Map<string, object>>} */
+  const _uiHookMounts = new Map();
+  /** @type {Map<Element, Map<string, Element>>} */
+  const _uiHookWrappers = new Map();
+  let _uiHookSeq = 0;
+  let _uiHookScheduled = false;
+  let _uiHookObserver = null;
+
+  function _findReactFiber(element) {
+    if (!element) return null;
+    try {
+      for (const key of Reflect.ownKeys(element)) {
+        if (typeof key === 'string' && (key.startsWith('__reactFiber$') || key.startsWith('__reactInternalInstance$'))) {
+          return element[key];
+        }
+      }
+    } catch { /* exotic nodes */ }
+    return null;
+  }
+
+  function _findFiberProps(element, predicate) {
+    if (!element || typeof predicate !== 'function') return null;
+    let direct = null;
+    try {
+      for (const key of Reflect.ownKeys(element)) {
+        if (typeof key === 'string' && key.startsWith('__reactProps$')) {
+          direct = element[key];
+          break;
+        }
+      }
+    } catch { /* ignore */ }
+    if (direct) {
+      try { if (predicate(direct)) return direct; } catch { /* ignore */ }
+    }
+
+    let fiber = _findReactFiber(element);
+    for (let depth = 0; fiber && depth < 30; depth += 1) {
+      try {
+        if (fiber.memoizedProps && predicate(fiber.memoizedProps)) return fiber.memoizedProps;
+      } catch { /* ignore */ }
+      fiber = fiber.return;
+    }
+    return null;
+  }
+
+  function _hookSignature(kind, context) {
+    if (kind === 'chat-bar') return String(context.channelId ?? '');
+    if (kind === 'message-popover') {
+      const message = context.message;
+      return `${context.messageId ?? ''}:${message?.content?.length ?? 0}:${message?.editedTimestamp ?? message?.updatedAt ?? ''}:${message?.deleted ? 1 : 0}`;
+    }
+    if (kind === 'member-badge') {
+      return `${context.userId ?? ''}:${context.guildId ?? ''}:${context.member?.status ?? ''}:${context.user?.status ?? ''}`;
+    }
+    if (kind === 'server-badge') return String(context.guildId ?? '');
+    if (kind === 'profile-badge') return String(context.userId ?? '');
+    return '';
+  }
+
+  function _renderHookIcon(container, icon, registration, context) {
+    if (!container || icon === undefined || icon === null) return;
+    if (typeof icon === 'string') {
+      const value = icon.trim();
+      if (/^<svg[\s>]/i.test(value)) {
+        container.innerHTML = value;
+        return;
+      }
+      if (/^(https?:|data:)/i.test(value)) {
+        const image = document.createElement('img');
+        image.src = value;
+        image.alt = '';
+        image.loading = 'lazy';
+        container.appendChild(image);
+        return;
+      }
+      container.textContent = value;
+      return;
+    }
+    _renderHookOutput(container, icon, registration, context);
+  }
+
+  function _renderHookOutput(container, output, registration, context) {
+    if (!container) return;
+    const React = _react;
+    if (typeof output === 'function') {
+      if (React) {
+        _renderHookOutput(container, React.createElement(output, {context, ...context}), registration, context);
+      } else {
+        reactApi.ready.then(() => scheduleUiHookScan());
+      }
+      return;
+    }
+    if (output && typeof output.then === 'function') {
+      output.then((value) => _renderHookOutput(container, value, registration, context))
+        .catch((err) => console.error(`[Reflux:UIHooks] "${registration.name}" render failed:`, err));
+      return;
+    }
+
+    const looksLikeReactElement = output && typeof output === 'object' &&
+      (output.$$typeof !== undefined || output._owner !== undefined);
+    if (!React && looksLikeReactElement) {
+      reactApi.ready.then(() => scheduleUiHookScan());
+      return;
+    }
+    if (React?.isValidElement(output)) {
+      reactApi.render(
+        React.createElement(
+          components.ErrorBoundary,
+          {
+            name: `UI hook: ${registration.name}`,
+            fallback: null,
+            onError: (error) => console.error(`[Reflux:UIHooks] "${registration.name}" failed:`, error),
+          },
+          output,
+        ),
+        container,
+      );
+      return;
+    }
+    reactApi.unmount(container);
+    if (output === undefined || output === null) {
+      container.textContent = '';
+      return;
+    }
+    if (typeof Node !== 'undefined' && output instanceof Node) {
+      container.replaceChildren(output);
+      return;
+    }
+    container.textContent = String(output);
+  }
+
+  function _makeDefaultBadge(registration, context) {
+    const badge = document.createElement('span');
+    badge.className = 'reflux-badge';
+    badge.title = registration.description ?? registration.tooltip ?? '';
+    if (registration.color || registration.backgroundColor) {
+      badge.style.color = registration.color ?? '';
+      badge.style.background = registration.backgroundColor ?? '';
+      badge.style.borderColor = registration.borderColor ?? '';
+    }
+    if (registration.icon) {
+      const icon = document.createElement('span');
+      icon.className = 'reflux-hook-icon';
+      _renderHookIcon(icon, registration.icon, registration, context);
+      badge.appendChild(icon);
+    }
+    const text = registration.label ?? registration.text ?? '';
+    if (text) {
+      const label = document.createElement('span');
+      label.textContent = String(text);
+      badge.appendChild(label);
+    }
+    return badge;
+  }
+
+  function _createHookElement(registration, kind, context) {
+    if (registration.mode === 'button' || registration.action || registration.onClick) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = registration.className ?? UI_HOOK_KINDS[kind].buttonClass ?? 'reflux-badge';
+      button.title = registration.tooltip ?? registration.description ?? registration.label ?? '';
+      button.setAttribute('aria-label', registration.ariaLabel ?? registration.label ?? registration.name);
+      if (registration.disabled) button.disabled = true;
+      if (registration.icon) {
+        const icon = document.createElement('span');
+        icon.className = 'reflux-hook-icon';
+        _renderHookIcon(icon, registration.icon, registration, context);
+        button.appendChild(icon);
+      }
+      const hasCustomVisual = Boolean(registration.icon) || typeof registration.render === 'function';
+      if (registration.label && (registration.showLabel || !hasCustomVisual)) {
+        const label = document.createElement('span');
+        label.className = 'reflux-hook-label';
+        label.textContent = String(registration.label);
+        button.appendChild(label);
+      }
+      if (typeof registration.render === 'function') {
+        const host = document.createElement('span');
+        host.className = 'reflux-hook-icon';
+        button.appendChild(host);
+        _renderHookOutput(host, registration.render(context), registration, context);
+      }
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (registration.disabled) return;
+        try {
+          const result = (registration.onClick ?? registration.action)?.(event, context);
+          if (result && typeof result.catch === 'function') {
+            result.catch((err) => console.error(`[Reflux:UIHooks] "${registration.name}" action failed:`, err));
+          }
+        } catch (err) {
+          console.error(`[Reflux:UIHooks] "${registration.name}" action threw:`, err);
+        }
+      });
+      return button;
+    }
+
+    if (typeof registration.render === 'function') {
+      const host = document.createElement('div');
+      host.className = 'reflux-hook-decoration';
+      _renderHookOutput(host, registration.render(context), registration, context);
+      return host;
+    }
+    return _makeDefaultBadge(registration, context);
+  }
+
+  function _ensureHookWrapper(root, kind) {
+    let wrappers = _uiHookWrappers.get(root);
+    if (!wrappers) {
+      wrappers = new Map();
+      _uiHookWrappers.set(root, wrappers);
+    }
+    let wrapper = wrappers.get(kind);
+    if (wrapper?.isConnected) return wrapper;
+
+    wrapper = document.createElement('div');
+    wrapper.className = UI_HOOK_KINDS[kind].wrapperClass;
+    wrapper.dataset.refluxHookKind = kind;
+    wrappers.set(kind, wrapper);
+    const config = UI_HOOK_KINDS[kind];
+    if (config.placement === 'before-last' && root.lastElementChild) {
+      root.insertBefore(wrapper, root.lastElementChild);
+    } else {
+      root.appendChild(wrapper);
+    }
+    return wrapper;
+  }
+
+  function _removeUiHookMount(root, key) {
+    const mounts = _uiHookMounts.get(root);
+    const mount = mounts?.get(key);
+    if (!mount) return;
+    try { reactApi.unmount(mount.element); } catch { /* ignore */ }
+    mount.element.remove();
+    mounts.delete(key);
+    if (!mounts.size) {
+      _uiHookMounts.delete(root);
+      const wrappers = _uiHookWrappers.get(root);
+      const wrapper = wrappers?.get(mount.registration.kind);
+      if (wrapper && !wrapper.children.length) {
+        wrapper.remove();
+        wrappers.delete(mount.registration.kind);
+        if (!wrappers.size) _uiHookWrappers.delete(root);
+      }
+    }
+  }
+
+  function _applyUiHook(root, kind, registration) {
+    const config = UI_HOOK_KINDS[kind];
+    let context;
+    try { context = config.context(root); }
+    catch (err) {
+      console.error(`[Reflux:UIHooks] Context for "${registration.name}" threw:`, err);
+      return;
+    }
+    if (registration.enabled === false) {
+      _removeUiHookMount(root, registration.key);
+      return;
+    }
+    if (typeof registration.filter === 'function') {
+      let applies = false;
+      try { applies = Boolean(registration.filter(context)); }
+      catch (err) {
+        console.error(`[Reflux:UIHooks] Filter for "${registration.name}" threw:`, err);
+      }
+      if (!applies) {
+        _removeUiHookMount(root, registration.key);
+        return;
+      }
+    }
+
+    const signature = _hookSignature(kind, context);
+    let mounts = _uiHookMounts.get(root);
+    let mount = mounts?.get(registration.key);
+    if (mount && mount.element.isConnected && mount.signature === signature) return;
+
+    // Recreate the mount when its context changes. Buttons capture the context
+    // in their click handler, so mutating the old object in place would leave
+    // actions (for example a message button) pointing at the previous message.
+    if (mount) {
+      _removeUiHookMount(root, registration.key);
+      mounts = _uiHookMounts.get(root);
+      mount = null;
+    }
+
+    const wrapper = _ensureHookWrapper(root, kind);
+    const element = _createHookElement(registration, kind, context);
+    wrapper.appendChild(element);
+    if (!mounts) {
+      mounts = new Map();
+      _uiHookMounts.set(root, mounts);
+    }
+    mount = {element, registration, context, signature};
+    mounts.set(registration.key, mount);
+  }
+
+  function _scanUiHooks() {
+    _uiHookScheduled = false;
+    if (!_uiHooks.size) {
+      for (const root of Array.from(_uiHookMounts.keys())) {
+        for (const key of Array.from(_uiHookMounts.get(root)?.keys() ?? [])) _removeUiHookMount(root, key);
+      }
+      return;
+    }
+
+    const activeRoots = new Set();
+    for (const [kind, config] of Object.entries(UI_HOOK_KINDS)) {
+      const registrations = Array.from(_uiHooks.values())
+        .filter((registration) => registration.kind === kind)
+        .sort((a, b) => (a.order - b.order) || a.name.localeCompare(b.name));
+      if (!registrations.length) continue;
+
+      const roots = new Set();
+      for (const selector of config.selectors) {
+        let matches = [];
+        try { matches = Array.from(document.querySelectorAll(selector)); }
+        catch { /* selector can fail on older builds */ }
+        for (const root of matches) roots.add(root);
+      }
+      for (const root of roots) {
+        if (!root.isConnected) continue;
+        activeRoots.add(root);
+        for (const registration of registrations) _applyUiHook(root, kind, registration);
+      }
+    }
+
+    for (const [root, mounts] of Array.from(_uiHookMounts)) {
+      if (!activeRoots.has(root) || !root.isConnected) {
+        for (const key of Array.from(mounts.keys())) _removeUiHookMount(root, key);
+        _uiHookWrappers.delete(root);
+      }
+    }
+  }
+
+  function scheduleUiHookScan() {
+    if (_uiHookScheduled) return;
+    _uiHookScheduled = true;
+    const run = () => {
+      try { _scanUiHooks(); }
+      catch (err) { console.error('[Reflux:UIHooks] Scan failed:', err); }
+    };
+    if (typeof window.requestAnimationFrame === 'function') window.requestAnimationFrame(run);
+    else setTimeout(run, 16);
+  }
+
+  function ensureUiHookObserver() {
+    if (_uiHookObserver) return;
+    ui.injectCSS('ui-hooks', UI_HOOK_CSS);
+    _uiHookObserver = new MutationObserver(() => scheduleUiHookScan());
+    _uiHookObserver.observe(document.documentElement, {childList: true, subtree: true});
+    scheduleUiHookScan();
+  }
+
+  function registerUiHook(kind, definition, options = {}) {
+    const config = UI_HOOK_KINDS[kind];
+    if (!config) throw new Error(`Unknown UI hook kind "${kind}".`);
+    const input = typeof definition === 'function'
+      ? {...options, render: definition}
+      : {...options, ...definition};
+    if (typeof input.render !== 'function' && typeof input.onClick !== 'function' &&
+        typeof input.action !== 'function' && !input.icon && !input.label) {
+      throw new Error(`UI hook "${kind}" requires render(), onClick(), or a label.`);
+    }
+    const name = String(input.name ?? input.id ?? `${kind}-${++_uiHookSeq}`);
+    const key = `${kind}:${name}:${++_uiHookSeq}`;
+    const registration = {
+      ...input,
+      key,
+      kind,
+      name,
+      order: Number.isFinite(input.order) ? input.order : 0,
+      mode: input.mode ?? ((input.onClick || input.action) ? 'button' : 'content'),
+    };
+    _uiHooks.set(key, registration);
+    ensureUiHookObserver();
+    scheduleUiHookScan();
+    return () => {
+      _uiHooks.delete(key);
+      for (const root of Array.from(_uiHookMounts.keys())) _removeUiHookMount(root, key);
+      scheduleUiHookScan();
+    };
+  }
+
+  function refreshUiHooks(kind = null) {
+    for (const [root, mounts] of Array.from(_uiHookMounts)) {
+      for (const [key, mount] of Array.from(mounts)) {
+        if (kind && mount.registration.kind !== kind) continue;
+        _removeUiHookMount(root, key);
+      }
+    }
+    scheduleUiHookScan();
+  }
+
+  const chatBar = {
+    addButton(definition, options) { return registerUiHook('chat-bar', {...definition, mode: 'button'}, options); },
+    register: registerUiHook,
+    refresh() { refreshUiHooks('chat-bar'); },
+    get buttons() { return Array.from(_uiHooks.values()).filter((hook) => hook.kind === 'chat-bar'); },
+  };
+
+  const messagePopover = {
+    addButton(definition, options) { return registerUiHook('message-popover', {...definition, mode: 'button'}, options); },
+    register: registerUiHook,
+    refresh() { refreshUiHooks('message-popover'); },
+    get buttons() { return Array.from(_uiHooks.values()).filter((hook) => hook.kind === 'message-popover'); },
+  };
+
+  function _userContextFromElement(element) {
+    const props = _findFiberProps(element, (value) =>
+      value?.user?.id || value?.profile?.user?.id || value?.userId);
+    const user = props?.user ?? props?.profile?.user ?? (props?.userId ? {id: props.userId} : null);
+    return {
+      user,
+      userId: user?.id ?? props?.userId ?? null,
+      profile: props?.profile ?? null,
+      member: props?.guildMember ?? props?.member ?? null,
+      guildId: props?.guildId ?? null,
+      channelId: props?.channelId ?? currentChannelId(),
+    };
+  }
+
+  const members = {
+    registerBadge(definition, options) { return registerUiHook('member-badge', definition, options); },
+    registerDecoration(definition, options) { return registerUiHook('member-badge', definition, options); },
+    addBadge(definition, options) { return members.registerBadge(definition, options); },
+    addDecoration(definition, options) { return members.registerDecoration(definition, options); },
+    refresh() { refreshUiHooks('member-badge'); },
+    getUserFromElement(element) { return _userContextFromElement(element); },
+    get badges() { return Array.from(_uiHooks.values()).filter((hook) => hook.kind === 'member-badge'); },
+  };
+
+  const servers = {
+    registerBadge(definition, options) { return registerUiHook('server-badge', definition, options); },
+    registerDecoration(definition, options) { return registerUiHook('server-badge', definition, options); },
+    addBadge(definition, options) { return servers.registerBadge(definition, options); },
+    addDecoration(definition, options) { return servers.registerDecoration(definition, options); },
+    refresh() { refreshUiHooks('server-badge'); },
+    getGuildFromElement(element) {
+      const row = element?.closest?.('[data-guild-id]') ?? element;
+      const props = _findFiberProps(element, (value) => value?.guild?.id) ??
+        _findFiberProps(row, (value) => value?.guild?.id);
+      const id = props?.guild?.id ?? row?.getAttribute?.('data-guild-id') ?? null;
+      let guild = props?.guild ?? null;
+      if (!guild) {
+        const store = findStore('guilds');
+        if (store && id) {
+          try { guild = store.getGuild(id) ?? null; }
+          catch { /* ignore */ }
+        }
+      }
+      return {guild, guildId: id, element: row};
+    },
+    get badges() { return Array.from(_uiHooks.values()).filter((hook) => hook.kind === 'server-badge'); },
+  };
+
+  const badges = {
+    registerUser(definition, options = {}) {
+      const cleanups = [];
+      if (options.memberList !== false) {
+        cleanups.push(registerUiHook('member-badge', definition, options));
+      }
+      if (options.profiles !== false) {
+        cleanups.push(registerUiHook('profile-badge', definition, options));
+      }
+      return () => {
+        for (const cleanup of cleanups.reverse()) {
+          try { cleanup(); } catch { /* already removed */ }
+        }
+      };
+    },
+    registerGuild(definition, options) {
+      return registerUiHook('server-badge', definition, options);
+    },
+    register(definition, options = {}) {
+      const target = definition?.target ?? options.target ?? 'user';
+      if (target === 'guild' || target === 'server') return badges.registerGuild(definition, options);
+      if (target === 'member') return members.registerBadge(definition, options);
+      if (target === 'profile') return registerUiHook('profile-badge', definition, options);
+      return badges.registerUser(definition, options);
+    },
+    refresh() {
+      refreshUiHooks('member-badge');
+      refreshUiHooks('profile-badge');
+      refreshUiHooks('server-badge');
+    },
+    user(definition, options) { return badges.registerUser(definition, options); },
+    guild(definition, options) { return badges.registerGuild(definition, options); },
+  };
+
+  function _simpleHookList(value) {
+    if (!value) return [];
+    if (Array.isArray(value)) {
+      return value.filter(Boolean).map((entry, index) =>
+        typeof entry === 'function' ? {name: `item${index}`, render: entry} : {...entry, name: entry.name ?? entry.id ?? `item${index}`});
+    }
+    if (typeof value === 'object') {
+      return Object.entries(value).filter(([, entry]) => Boolean(entry)).map(([name, entry]) =>
+        typeof entry === 'function' ? {name, render: entry} : {...entry, name: entry.name ?? name});
+    }
+    return [];
+  }
+
+  function installPluginUiHooks(plugin) {
+    if (!plugin?.name) return () => {};
+    const cleanups = [];
+    const registerList = (kind, value, factory) => {
+      for (const entry of _simpleHookList(value)) {
+        try { cleanups.push(factory(entry)); }
+        catch (err) { console.error(`[Reflux:UIHooks] Could not register "${entry.name}" for "${plugin.name}":`, err); }
+      }
+    };
+
+    registerList('chat-bar', plugin.chatBarButtons, (entry) => chatBar.addButton(entry));
+    registerList('message-popover', plugin.messagePopoverButtons, (entry) => messagePopover.addButton(entry));
+    registerList('member-badge', plugin.memberBadges ?? plugin.userBadges ?? plugin.memberDecorations,
+      (entry) => members.registerBadge(entry));
+    registerList('server-badge', plugin.serverBadges ?? plugin.guildBadges ?? plugin.serverDecorations,
+      (entry) => servers.registerBadge(entry));
+
+    return () => {
+      for (const cleanup of cleanups.reverse()) {
+        try { cleanup(); } catch { /* already removed */ }
+      }
+    };
+  }
 
   // ---------------------------------------------------------------------------
   // Context menu API
@@ -3655,6 +4889,141 @@
   ensureCommandInterceptor();
 
   // ---------------------------------------------------------------------------
+  // Per-plugin renderer IPC
+  // ---------------------------------------------------------------------------
+
+  /** @type {Map<string, Function>} */
+  const _pluginIpcHandlers = new Map();
+  /** @type {Map<string, Set<Function>>} */
+  const _pluginIpcListeners = new Map();
+  let _pluginIpcBridgeInstalled = false;
+
+  function _pluginIpcKey(pluginName, channel) {
+    return `${String(pluginName ?? '')}\u0000${String(channel ?? '')}`;
+  }
+
+  function _ensurePluginIpcBridge() {
+    if (_pluginIpcBridgeInstalled) return;
+    const bridge = window.refluxBridge;
+    if (!bridge) return;
+    _pluginIpcBridgeInstalled = true;
+
+    if (typeof bridge.onPluginIpcEvent === 'function') {
+      bridge.onPluginIpcEvent((pluginName, channel, data) => {
+        const dispatch = (key) => {
+          for (const listener of Array.from(_pluginIpcListeners.get(key) ?? [])) {
+            try { listener(data, {pluginName, channel}); }
+            catch (err) { console.error(`[Reflux:PluginIpc] "${key}" listener threw:`, err); }
+          }
+        };
+        dispatch(_pluginIpcKey(pluginName, channel));
+        dispatch(_pluginIpcKey(pluginName, '*'));
+        events.emit('plugin-ipc', pluginName, channel, data);
+        events.emit(`plugin-ipc:${pluginName}:${channel}`, data);
+      });
+    }
+
+    if (typeof bridge.onPluginIpcRequest === 'function') {
+      bridge.onPluginIpcRequest(async (pluginName, channel, args) => {
+        const handler = _pluginIpcHandlers.get(_pluginIpcKey(pluginName, channel));
+        if (!handler) return {handled: false};
+        const result = await handler(...(Array.isArray(args) ? args : []));
+        return {handled: true, value: result};
+      });
+    }
+  }
+
+  function pluginIpcInvoke(pluginName, channel, ...args) {
+    const bridge = window.refluxBridge;
+    if (!bridge?.invokePluginIpc) {
+      return Promise.reject(new Error('Native plugin IPC is unavailable (run inside Fluxer).'));
+    }
+    return bridge.invokePluginIpc(String(pluginName), String(channel), args);
+  }
+
+  function pluginIpcHandle(pluginName, channel, handler) {
+    if (typeof handler !== 'function') throw new Error('pluginIpc.handle() requires a function.');
+    _ensurePluginIpcBridge();
+    const key = _pluginIpcKey(pluginName, channel);
+    _pluginIpcHandlers.set(key, handler);
+    return () => {
+      if (_pluginIpcHandlers.get(key) === handler) _pluginIpcHandlers.delete(key);
+    };
+  }
+
+  function pluginIpcOn(pluginName, channel, listener) {
+    if (typeof listener !== 'function') return () => {};
+    _ensurePluginIpcBridge();
+    const key = _pluginIpcKey(pluginName, channel);
+    if (!_pluginIpcListeners.has(key)) _pluginIpcListeners.set(key, new Set());
+    _pluginIpcListeners.get(key).add(listener);
+    return () => {
+      const listeners = _pluginIpcListeners.get(key);
+      listeners?.delete(listener);
+      if (listeners && !listeners.size) _pluginIpcListeners.delete(key);
+    };
+  }
+
+  function pluginIpcRemoveAll(pluginName) {
+    const prefix = `${String(pluginName ?? '')}\u0000`;
+    for (const key of Array.from(_pluginIpcHandlers.keys())) {
+      if (key.startsWith(prefix)) _pluginIpcHandlers.delete(key);
+    }
+    for (const key of Array.from(_pluginIpcListeners.keys())) {
+      if (key.startsWith(prefix)) _pluginIpcListeners.delete(key);
+    }
+  }
+
+  function pluginIpcForPlugin(pluginName) {
+    const name = String(pluginName ?? '');
+    if (!name) throw new Error('pluginIpc.forPlugin() requires a plugin name.');
+    return {
+      pluginName: name,
+      invoke(channel, ...args) { return pluginIpcInvoke(name, channel, ...args); },
+      handle(channel, handler) { return pluginIpcHandle(name, channel, handler); },
+      on(channel, listener) { return pluginIpcOn(name, channel, listener); },
+      once(channel, listener) {
+        const off = pluginIpcOn(name, channel, (data, meta) => {
+          off();
+          listener(data, meta);
+        });
+        return off;
+      },
+      removeAll() { pluginIpcRemoveAll(name); },
+    };
+  }
+
+  const pluginIpc = {
+    get available() {
+      _ensurePluginIpcBridge();
+      return Boolean(window.refluxBridge?.invokePluginIpc);
+    },
+    invoke: pluginIpcInvoke,
+    handle: pluginIpcHandle,
+    on: pluginIpcOn,
+    forPlugin: pluginIpcForPlugin,
+    removeAll: pluginIpcRemoveAll,
+  };
+
+  function installPluginRendererIpc(plugin) {
+    if (!plugin?.name) return () => {};
+    if (!plugin.ipc) plugin.ipc = pluginIpc.forPlugin(plugin.name);
+    const handlers = plugin.rendererIpcHandlers ?? plugin.ipcHandlers;
+    if (!handlers || typeof handlers !== 'object') return () => {};
+    const cleanups = [];
+    for (const [channel, handler] of Object.entries(handlers)) {
+      if (typeof handler !== 'function') continue;
+      try { cleanups.push(pluginIpcHandle(plugin.name, channel, handler)); }
+      catch (err) { console.error(`[Reflux:PluginIpc] Invalid handler "${channel}" for "${plugin.name}":`, err); }
+    }
+    return () => {
+      for (const cleanup of cleanups.reverse()) {
+        try { cleanup(); } catch { /* already removed */ }
+      }
+    };
+  }
+
+  // ---------------------------------------------------------------------------
   // Plugin registry (renderer-side)
   // ---------------------------------------------------------------------------
 
@@ -3680,6 +5049,12 @@
         try { plugin.settingsStore = createSettingsStore(plugin.name, plugin.settings); }
         catch (err) { console.error(`[Reflux] Could not create settings store for "${plugin.name}":`, err); }
       }
+      if (plugin.name) {
+        if (!plugin.ipc) plugin.ipc = pluginIpc.forPlugin(plugin.name);
+        if (!plugin.styles) plugin.styles = styles.forPlugin(plugin.name);
+        if (!plugin.patches) plugin.patches = patcher.createRegistry(plugin.name);
+        if (!plugin.dataStore) plugin.dataStore = data.createStore(plugin.name);
+      }
       let cleanup = null;
       const cleanups = [];
       try {
@@ -3687,6 +5062,13 @@
         if (typeof extensionCleanup === 'function') cleanups.push(extensionCleanup);
         const commandCleanup = installPluginCommands(plugin);
         if (typeof commandCleanup === 'function') cleanups.push(commandCleanup);
+        const uiCleanup = installPluginUiHooks(plugin);
+        if (typeof uiCleanup === 'function') cleanups.push(uiCleanup);
+        const ipcCleanup = installPluginRendererIpc(plugin);
+        if (typeof ipcCleanup === 'function') cleanups.push(ipcCleanup);
+        cleanups.push(() => pluginIpcRemoveAll(plugin.name));
+        cleanups.push(() => plugin.patches?.dispose?.());
+        cleanups.push(() => plugin.styles?.clear?.());
 
         const result = plugin.start?.(patcher, __reflux);
         if (typeof result === 'function') cleanups.push(result);
@@ -3710,12 +5092,25 @@
 
     unregister(name) {
       const entry = _plugins.get(name);
-      if (!entry) return;
+      if (!entry) {
+        pluginIpcRemoveAll(name);
+        return;
+      }
       try { entry.cleanup?.(); } catch (err) { console.error(`[Reflux] "${name}" stop() threw:`, err); }
       _plugins.delete(name);
+      pluginIpcRemoveAll(name);
     },
 
+    async reload(name) {
+      const bridge = window.refluxBridge;
+      if (!bridge?.reloadPlugin) return false;
+      return bridge.reloadPlugin(name);
+    },
+
+    get(name) { return _plugins.get(name)?.plugin ?? null; },
+    has(name) { return _plugins.has(name); },
     list: () => Array.from(_plugins.keys()),
+    entries: () => Array.from(_plugins.values()).map((entry) => entry.plugin),
   };
 
   // ---------------------------------------------------------------------------
@@ -3733,11 +5128,22 @@
     gateway,
     stores,
     messages,
+    chatBar,
+    messagePopover,
+    members,
+    servers,
+    badges,
     notices,
     modals,
     toasts,
     commands,
     settings,
+    data,
+    DataStore: RefluxDataStore,
+    styles,
+    themes,
+    theme: themes,
+    pluginIpc,
     definePlugin,
     OptionType,
     react: reactApi,
