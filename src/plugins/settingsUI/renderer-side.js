@@ -51,20 +51,50 @@
 
   /**
    * Renders a plugin icon from three accepted formats:
-   *   - Raw SVG string  (<svg …>)
-   *   - Image URL       (https://… or data:…)
+   *   - Raw SVG string  (<svg …>) — sanitised through the shared icon policy.
+   *   - Image URL       (https://… or data:image/…)
    *   - Emoji / text    (anything else — short string)
-   * Falls back to the generic puzzle SVG when icon is falsy.
+   * Returns a DOM node. Falls back to the generic puzzle SVG when icon is falsy
+   * or when a raw SVG is rejected by the sanitizer.
    */
   function renderIcon(icon) {
-    if (!icon) return svgEl(SVG_PUZZLE, 18, 18);
+    const fallback = () => iconMarkup(svgEl(SVG_PUZZLE, 18, 18));
+    if (!icon) return fallback();
     const s = String(icon).trim();
-    if (/^<svg/i.test(s)) return s;
-    if (/^(https?:|data:)/i.test(s)) {
-      return `<img src="${esc(s)}" width="22" height="22" style="object-fit:contain;border-radius:4px;" alt="" onerror="this.replaceWith(document.createRange().createContextualFragment('${svgEl(SVG_PUZZLE, 18, 18).replace(/'/g, "\\'")}'))">`;
+    if (!s) return fallback();
+
+    if (/^<svg/i.test(s)) {
+      const safe = window.__reflux?.html?.sanitize?.(s, {profile: 'icon'}) ?? '';
+      return safe ? iconMarkup(safe) : fallback();
     }
+
+    if (/^(https?:\/\/|data:image\/(?:png|jpe?g|gif|webp|avif);)/i.test(s)) {
+      const img = document.createElement('img');
+      img.src = s;
+      img.width = 22;
+      img.height = 22;
+      img.alt = '';
+      img.loading = 'lazy';
+      img.decoding = 'async';
+      img.style.objectFit = 'contain';
+      img.style.borderRadius = '4px';
+      img.addEventListener('error', () => img.replaceWith(fallback()), {once: true});
+      return img;
+    }
+
     // Emoji or short text
-    return `<span style="font-size:20px;line-height:1;user-select:none;">${esc(s)}</span>`;
+    const span = document.createElement('span');
+    span.style.fontSize = '20px';
+    span.style.lineHeight = '1';
+    span.style.userSelect = 'none';
+    span.textContent = s;
+    return span;
+  }
+
+  function iconMarkup(markup) {
+    const template = document.createElement('template');
+    template.innerHTML = markup;
+    return template.content.firstElementChild ?? document.createTextNode('');
   }
 
   // ─── Utility ──────────────────────────────────────────────────────────────
@@ -676,15 +706,16 @@
   }
 
   function parseMetadata(src, filename) {
-    const meta = { name: filename.replace(/\.js$/i,''), description: '', author: '', version: '', preview: '', icon: '' };
-    const block = src.match(/\/\/\s*==RefluxPlugin==([\s\S]*?)\/\/\s*==\/RefluxPlugin==/i);
-    if (block) {
-      for (const line of block[1].split('\n')) {
-        const m = line.match(/\/\/\s*@(\w+)\s+(.*)/);
-        if (m && m[1] in meta) meta[m[1]] = m[2].trim();
-      }
-    }
-    return meta;
+    const metadata = window.__refluxPluginMetadata;
+    if (metadata?.parseMetadata) return metadata.parseMetadata(src, filename);
+    return {
+      name: filename.replace(/\.js$/i, ''),
+      description: '',
+      author: '',
+      version: '',
+      preview: '',
+      icon: '',
+    };
   }
 
   function runPlugin(src) {
@@ -701,9 +732,9 @@
     _importedRuntime.set(plugin.id, after.filter(name => !before.has(name)));
   }
 
-  function stopImportedPlugin(id) {
+  async function stopImportedPlugin(id) {
     for (const name of _importedRuntime.get(id) ?? []) {
-      window.__reflux?.pluginManager?.unregister?.(name);
+      await window.__reflux?.pluginManager?.unregister?.(name);
     }
     _importedRuntime.delete(id);
   }
@@ -945,7 +976,7 @@
     // Left: icon — use plugin-specific icon if available, else generic puzzle
     const iconWrap = document.createElement('div');
     iconWrap.className = 'reflux-plugin-icon';
-    iconWrap.innerHTML = renderIcon(icon);
+    iconWrap.appendChild(renderIcon(icon));
 
     // Middle: text info
     const info = document.createElement('div');
@@ -1302,14 +1333,20 @@
       if (!file) return;
       const reader = new FileReader();
       reader.onload = async (ev) => {
-        const source = ev.target.result;
+        const source = String(ev.target.result ?? '');
         const meta   = parseMetadata(source, file.name);
-        const plugin = { id: uid(), ...meta, enabled: true, source };
         const all    = await getImported();
+        const validation = window.__refluxPluginMetadata?.validateImport?.({source, meta, imported: all});
+        if (validation && !validation.ok) {
+          window.__reflux?.toasts?.error?.(validation.error);
+          return;
+        }
+        const plugin = { id: uid(), ...meta, enabled: true, source };
         all.push(plugin);
         await saveImported(all);
         startImportedPlugin(plugin);
         await renderPlugins();
+        window.__reflux?.toasts?.success?.(`Imported ${meta.name}`);
       };
       reader.readAsText(file);
       fileInput.value = '';
@@ -1383,7 +1420,7 @@
             const t = all.find(x => x.id === p.id);
             if (!t) return;
             if (on) startImportedPlugin(t);
-            else stopImportedPlugin(t.id);
+            else await stopImportedPlugin(t.id);
             t.enabled = on;
             await saveImported(all);
           },
@@ -1391,7 +1428,7 @@
             const all = await getImported();
             const idx = all.findIndex(x => x.id === p.id);
             if (idx !== -1) {
-              stopImportedPlugin(p.id);
+              await stopImportedPlugin(p.id);
               all.splice(idx, 1);
               await saveImported(all);
               renderPlugins();

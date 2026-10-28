@@ -68,6 +68,7 @@ For convenience, the root package exposes the same flow as npm scripts:
 npm run cli          # install / repair the current Fluxer instance
 npm run update-dev   # same as above, for local development
 npm run unpatch      # restore Fluxer's original app.asar
+npm test             # run the VM/jsdom smoke harness
 ```
 
 Restart Fluxer after running an install/update command.
@@ -207,6 +208,9 @@ src/
     settings.js     Read/write settings.json, IPC handlers
     pluginData.js   Read/write per-plugin JSON data, IPC handlers
     pluginManager.js  Discover, start/stop plugins, IPC handlers
+    safeHtml.js     Allowlist-based HTML/SVG sanitizer shared by plugins
+    pluginMetadata.js  Import metadata parsing and validation
+    messageHistory.js  Message history serialization, import, and limits
     patcher.js      Thin wrapper around window.__reflux.patcher
     ui.js           Renderer-side UI helper passthrough
   plugins/
@@ -214,6 +218,7 @@ src/
     messageLogger/  Deleted/edited message history with optional persistence
     debugTools/     Redacted gateway event inspector with copyable logs
     invisibleTyping/ Cancels outgoing typing-indicator requests
+tests/              VM/jsdom smoke harness (npm test)
 ```
 
 <h2 align="center">What injection modifies</h2>

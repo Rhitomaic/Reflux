@@ -35,6 +35,19 @@ const REFLUX_ROOT    = nodePath.resolve(__dirname, '..');
 const RENDERER_PATH  = nodePath.join(REFLUX_ROOT, 'src', 'renderer.js');
 const PRELOAD_PATH   = nodePath.join(REFLUX_ROOT, 'src', 'preload.js');
 const PLUGIN_SCHEMA_PATH = nodePath.join(REFLUX_ROOT, 'src', 'core', 'pluginSchema.js');
+const SAFE_HTML_PATH = nodePath.join(REFLUX_ROOT, 'src', 'core', 'safeHtml.js');
+const PLUGIN_METADATA_PATH = nodePath.join(REFLUX_ROOT, 'src', 'core', 'pluginMetadata.js');
+const MESSAGE_HISTORY_PATH = nodePath.join(REFLUX_ROOT, 'src', 'core', 'messageHistory.js');
+
+// Shared renderer-side helpers, injected before renderer.js.  Everything in
+// this list must be a self-contained script that installs its own window
+// global.
+const RENDERER_HELPER_PATHS = [
+  PLUGIN_SCHEMA_PATH,
+  SAFE_HTML_PATH,
+  PLUGIN_METADATA_PATH,
+  MESSAGE_HISTORY_PATH,
+];
 
 // ---------------------------------------------------------------------------
 // Bootstrap core modules
@@ -51,6 +64,17 @@ const pluginWatcher = require('./core/pluginWatcher.js');
 settings.registerIpc(ipcMain);
 pluginData.registerIpc(ipcMain);
 pluginIpc.registerIpc(ipcMain);
+// Unregister a plugin from all live Fluxer tabs, calling its stop() in the renderer.
+async function unregisterRendererPlugin(name) {
+  // No `void`: executeJavaScript must receive the unregister promise so an
+  // async stop() is awaited before the plugin is reported as disabled.
+  const script = `window.__reflux?.pluginManager.unregister(${JSON.stringify(name)})`;
+  for (const wc of getFluxerWebContents()) {
+    await wc.executeJavaScript(script).catch(e =>
+      console.error(`[Reflux:Main] Live-disable "${name}" failed:`, e.message));
+  }
+}
+
 pluginManager.registerIpc(ipcMain, {
   // Inject (or re-inject) a plugin's renderer script into all live Fluxer tabs.
   // The plugin's renderer-side IIFE must reset its own guard flag in stop() for
@@ -61,11 +85,7 @@ pluginManager.registerIpc(ipcMain, {
 
   // Unregister a plugin from all live Fluxer tabs, calling its stop() in the renderer.
   async onRendererDisable(name) {
-    const script = `void window.__reflux?.pluginManager.unregister(${JSON.stringify(name)})`;
-    for (const wc of getFluxerWebContents()) {
-      await wc.executeJavaScript(script).catch(e =>
-        console.error(`[Reflux:Main] Live-disable "${name}" failed:`, e.message));
-    }
+    await unregisterRendererPlugin(name);
   },
 
   // Hot reload: stop the old renderer instance, then execute the new bundle.
@@ -117,14 +137,15 @@ let _rendererScript = null;
 function getRendererScript() {
   if (_rendererScript !== null) return _rendererScript;
   try {
-    // pluginSchema.js installs window.__refluxPluginSchema, which renderer.js
-    // uses for definePlugin()/OptionType in the web context.
-    const schemaScript = nodeFs.readFileSync(PLUGIN_SCHEMA_PATH, 'utf8');
+    // Helpers install window.__refluxPluginSchema, window.__refluxSafeHtml,
+    // window.__refluxPluginMetadata and window.__refluxMessageHistory before
+    // renderer.js runs.
+    const helpers = RENDERER_HELPER_PATHS.map((helperPath) => nodeFs.readFileSync(helperPath, 'utf8'));
     const rendererScript = nodeFs.readFileSync(RENDERER_PATH, 'utf8');
-    _rendererScript = `${schemaScript}\n${rendererScript}`;
+    _rendererScript = `${helpers.join('\n')}\n${rendererScript}`;
     return _rendererScript;
   } catch (err) {
-    console.error('[Reflux:Main] Cannot read renderer.js:', err.message);
+    console.error('[Reflux:Main] Cannot read renderer bootstrap/helpers:', err.message);
     return null;
   }
 }
@@ -145,7 +166,7 @@ async function injectRendererPlugin(plugin, {unregisterFirst = false} = {}) {
 
   for (const wc of getFluxerWebContents()) {
     if (unregisterFirst) {
-      const unregister = `void window.__reflux?.pluginManager.unregister(${JSON.stringify(plugin.name)})`;
+      const unregister = `window.__reflux?.pluginManager.unregister(${JSON.stringify(plugin.name)})`;
       await wc.executeJavaScript(unregister).catch(e =>
         console.error(`[Reflux:Main] Live-unload "${plugin.name}" failed:`, e.message));
     }
@@ -220,7 +241,7 @@ app.on('web-contents-created', (_event, wc) => {
   });
 });
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   // Register our preload via setPreloads() so it runs in the sandboxed preload
   // context without touching Fluxer's preload file.  This is the correct way
   // to inject into a sandboxed Electron preload — require() of arbitrary paths
@@ -231,7 +252,7 @@ app.whenReady().then(() => {
 
   // Load and start all enabled plugins (main-process side).  This must happen
   // after app ready because plugins may touch Electron session APIs.
-  pluginManager.loadAll();
+  await pluginManager.loadAll();
 
   if (settings.get('reflux.hotReload', true)) {
     hotReloadWatcher = pluginWatcher.start({
@@ -240,7 +261,7 @@ app.whenReady().then(() => {
         if (!settings.get('reflux.hotReload', true)) return;
         const name = pluginManager.nameForDirectory(dir);
         if (name) {
-          const result = pluginManager.reload(name);
+          const result = await pluginManager.reload(name);
           if (result?.enabled && !result.error && result.plugin) {
             await injectRendererPlugin(result.plugin, {unregisterFirst: true});
           }
@@ -248,7 +269,7 @@ app.whenReady().then(() => {
         }
 
         // New plugin directory: load it and inject its renderer if enabled.
-        const plugin = pluginManager.loadDirectory(dir);
+        const plugin = await pluginManager.loadDirectory(dir);
         if (!plugin) return;
         const info = pluginManager.list().find((entry) => entry.name === plugin.name);
         if (info?.enabled) await injectRendererPlugin(plugin, {unregisterFirst: true});
@@ -264,9 +285,23 @@ app.whenReady().then(() => {
   console.error('[Reflux:Main] app.whenReady() error:', err);
 });
 
-app.on('before-quit', () => {
+let quitAfterStop = false;
+
+app.on('before-quit', (event) => {
   hotReloadWatcher?.stop();
   hotReloadWatcher = null;
+  if (quitAfterStop) return;
+  quitAfterStop = true;
+  // Give async stop() implementations a chance to flush persistence before
+  // the process exits.
+  event.preventDefault();
+  (async () => {
+    const rendererPlugins = pluginManager.list().filter((plugin) => plugin.rendererSrc && plugin.enabled);
+    await Promise.allSettled(rendererPlugins.map((plugin) => unregisterRendererPlugin(plugin.name)));
+    await pluginManager.stopAll();
+  })()
+    .catch((err) => console.error('[Reflux:Main] Shutdown failed:', err))
+    .finally(() => app.quit());
 });
 
 console.log('[Reflux:Main] Bootstrap loaded.');

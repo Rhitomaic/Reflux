@@ -74,8 +74,8 @@ That's it. Reflux discovers and loads it automatically on the next Fluxer launch
 | `enabledByDefault` | `boolean` | | Defaults to `true` for backwards compatibility. |
 | `required` / `hidden` | `boolean` | | Mark core or hidden plugins. |
 | `requiresRestart` | `boolean` | | Hint that toggling the plugin needs a Fluxer restart. |
-| `start()` | `function` | ✅ | Called when the plugin is enabled. |
-| `stop()` | `function` | ✅ | Called when the plugin is disabled or Reflux unloads. |
+| `start()` | `function` | ✅ | Called when the plugin is enabled. May return a Promise. |
+| `stop()` | `function` | ✅ | Called when the plugin is disabled or Reflux unloads. May return a Promise; Reflux waits for it before hot reload replaces the plugin. |
 
 ### Plugin settings
 
@@ -277,6 +277,10 @@ module.exports = {
 };
 ```
 
+`start()` and `stop()` may be `async`; Reflux awaits both during enable,
+disable, and hot reload. This is useful when `stop()` needs to flush data before
+the old module is replaced.
+
 ### Native IPC from the main process
 
 Main-process plugins can expose functions that their renderer side calls, and
@@ -409,6 +413,45 @@ available when you need to call another plugin's explicitly shared channel.
 The bridge is unavailable outside the Fluxer desktop app; check
 `window.__reflux.pluginIpc.available` if your plugin can run in a browser build.
 
+### Safe HTML rendering
+
+Never insert untrusted or captured HTML with `innerHTML` directly. The shared
+sanitizer exposes two allowlist-based policies:
+
+```js
+const html = window.__reflux.html;
+
+// Fluxer message content (formatting, links, images, classes, safe styles).
+const safeMessage = html.sanitize(capturedHtml, {profile: 'message'});
+
+// Inline SVG plugin icons (paths, gradients, safe presentation attributes).
+const safeIcon = html.sanitize(pluginIconSvg, {profile: 'icon'});
+
+// Or write it straight to an element.
+html.set(element, safeMessage, {profile: 'message'});
+```
+
+Both policies strip scripts, event handlers, forms, embeds, dangerous URLs,
+external SVG references, and unsafe CSS. `message` allows safe `http(s)`,
+`mailto:`, `tel:`, `blob:`, and raster `data:image/*` URLs; `icon` only allows
+same-document `#id` references.
+
+Extend a policy when your plugin needs extra markup:
+
+```js
+html.sanitize(source, {
+  profile: 'message',
+  allowedTags: ['video', 'source'],
+  allowedAttributes: ['poster'],
+});
+```
+
+To replace the allowlist entirely, pass `tags` and `attributes` arrays instead.
+`html.escape(value)` escapes text, and `html.isSafeUrl(value, {kind: 'link'})` is
+available for URL-only checks.
+
+---
+
 ## Chat-bar and message-popover buttons
 
 Add buttons next to the composer controls or to a message's hover action bar.
@@ -527,6 +570,18 @@ await window.__reflux.pluginManager.reload('myPlugin');
 For reload to re-inject your renderer code, reset your double-injection guard
 inside `stop()`. Imported single-file plugins are managed by the settings UI and
 are not covered by the directory watcher.
+
+`stop()` may be synchronous or `async`. Both the main-process lifecycle and the
+renderer-side plugin manager await it, so persistence flushes finish before the
+new bundle is injected:
+
+```js
+async stop() {
+  await flushPendingWrites();
+  clearTimers();
+  window.__myPlugin_loaded = false;
+}
+```
 
 ## Patching React components
 
@@ -1295,7 +1350,7 @@ The `@icon` field accepts three formats:
 // @icon        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#ef4444" d="M12 2L2 7l10 5 10-5-10-5z"/></svg>
 ```
 
-Reflux renders whatever string is in `@icon` as the `src` of an `<img>` tag, falling back to displaying it as text if the image fails to load — so emojis and SVGs both work.
+Reflux sanitises raw SVG through the shared `icon` allowlist, renders image URLs with an `<img>` element, and shows other values as text. Failed images fall back to the generic puzzle icon through a real `error` listener (no inline JavaScript). Imported files are also rejected when they are empty, too large, or use a name that is already installed.
 
 The user imports it via **Reflux Settings → Plugins → Import Plugin**.
 

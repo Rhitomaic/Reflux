@@ -26,11 +26,17 @@
 
   const TAG = '[Reflux:MessageLogger]';
   const patcher = window.__reflux.patcher;
+  const messageHistory = window.__refluxMessageHistory;
   const PLUGIN_DATA_NAME = 'messageLogger';
   const SETTING_PERSIST = 'plugins.messageLogger.persistHistory';
   const MAX_PER_CHANNEL = 250;
   const MAX_TOTAL = 1200;
   const SAVE_DELAY_MS = 500;
+
+  if (!messageHistory) {
+    console.error(`${TAG} messageHistory helper was not injected; plugin disabled.`);
+    return;
+  }
 
   const SVG_TRASH = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="currentColor" viewBox="0 0 256 256" aria-hidden="true"><path d="M216,48H176V40a24,24,0,0,0-24-24H104A24,24,0,0,0,80,40v8H40a8,8,0,0,0,0,16h8V208a16,16,0,0,0,16,16H192a16,16,0,0,0,16-16V64h8a8,8,0,0,0,0-16ZM96,40a8,8,0,0,1,8-8h48a8,8,0,0,1,8,8v8H96Zm96,168H64V64H192ZM112,104v64a8,8,0,0,1-16,0V104a8,8,0,0,1,16,0Zm48,0v64a8,8,0,0,1-16,0V104a8,8,0,0,1,16,0Z"/></svg>';
   const SVG_COPY = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="currentColor" viewBox="0 0 256 256" aria-hidden="true"><path d="M216,32H88a8,8,0,0,0-8,8V80H40a8,8,0,0,0-8,8V216a8,8,0,0,0,8,8H168a8,8,0,0,0,8-8V176h40a8,8,0,0,0,8-8V40A8,8,0,0,0,216,32ZM160,208H48V96H160Zm48-48H176V88a8,8,0,0,0-8-8H96V48H208Z"/></svg>';
@@ -50,6 +56,7 @@
   let saveTimer = null;
   let saveInFlight = false;
   let saveAgain = false;
+  let savePromise = null;
   let removeCss = null;
   let unregisterContextMenu = null;
   let unsubscribeSetting = null;
@@ -62,12 +69,7 @@
   function channelState(channelId) {
     const id = String(channelId || '');
     if (!id) return {deleted: new Map(), edited: new Map()};
-    let state = history.get(id);
-    if (!state) {
-      state = {deleted: new Map(), edited: new Map()};
-      history.set(id, state);
-    }
-    return state;
+    return messageHistory.ensureChannel(history, id);
   }
 
   function toPlainMessage(message) {
@@ -93,14 +95,11 @@
   }
 
   function recordTimestamp(record) {
-    const raw = record?.message?.timestamp || record?.deletedAt || record?.editedAt || 0;
-    const value = typeof raw === 'number' ? raw : Date.parse(raw);
-    return Number.isFinite(value) ? value : 0;
+    return messageHistory.recordTimestamp(record);
   }
 
   function snowflakeTimestamp(id) {
-    try { return Number((BigInt(String(id)) >> 22n) + 1420070400000n); }
-    catch { return 0; }
+    return messageHistory.snowflakeTimestamp(id);
   }
 
   function formatTimestamp(raw) {
@@ -147,15 +146,7 @@
 
     // Empty channels (all messages deleted) have no data-channel-id nodes.
     // Fluxer routes are /channels/<guild-or-@me>/<channelId>[/<messageId>].
-    const parts = location.pathname.split('/').filter(Boolean);
-    if (parts[0] === 'channels' && parts.length >= 3) {
-      const last = parts[parts.length - 1];
-      const previous = parts[parts.length - 2];
-      if (history.has(last)) return last;
-      if (history.has(previous)) return previous;
-      return last;
-    }
-    return null;
+    return messageHistory.channelIdFromPath(location.pathname, (id) => history.has(id));
   }
 
   function getGroups(scroller) {
@@ -242,30 +233,12 @@
 
   function sanitizeFragment(html) {
     if (!html) return '';
-    const template = document.createElement('template');
-    template.innerHTML = String(html);
-    template.content.querySelectorAll('script, style, link, meta, object, embed').forEach(node => node.remove());
-    template.content.querySelectorAll('*').forEach(el => {
-      for (const attr of Array.from(el.attributes)) {
-        const name = attr.name.toLowerCase();
-        const value = attr.value || '';
-        if (name.startsWith('on') || name === 'id' || name.startsWith('data-reflux')) {
-          el.removeAttribute(attr.name);
-          continue;
-        }
-        if ((name === 'href' || name === 'src') && /^\s*javascript:/i.test(value)) {
-          el.removeAttribute(attr.name);
-          continue;
-        }
-        if (name === 'contenteditable' || name === 'tabindex') el.removeAttribute(attr.name);
-      }
-      if (el.matches('button, input, textarea, select')) {
-        el.setAttribute('disabled', '');
-        el.setAttribute('tabindex', '-1');
-      }
-      if (el.tagName === 'A') el.setAttribute('rel', 'noopener noreferrer');
-    });
-    return template.innerHTML;
+    const sanitizer = window.__reflux?.html;
+    if (!sanitizer?.sanitize) {
+      console.error(`${TAG} Safe HTML helper is unavailable; refusing to render captured HTML.`);
+      return '';
+    }
+    return sanitizer.sanitize(String(html), {profile: 'message'});
   }
 
   // ---------------------------------------------------------------------------
@@ -381,32 +354,7 @@
   }
 
   function enforceLimits() {
-    const all = [];
-    for (const [channelId, state] of history) {
-      for (const [id, record] of state.deleted) all.push({channelId, id, record, kind: 'deleted'});
-      for (const [id, record] of state.edited) all.push({channelId, id, record, kind: 'edited'});
-    }
-    all.sort((a, b) => recordTimestamp(b.record) - recordTimestamp(a.record));
-
-    const keep = new Set();
-    const perChannel = new Map();
-    for (const entry of all) {
-      const count = perChannel.get(entry.channelId) || 0;
-      if (count >= MAX_PER_CHANNEL) continue;
-      if (keep.size >= MAX_TOTAL) break;
-      perChannel.set(entry.channelId, count + 1);
-      keep.add(`${entry.channelId}\u0000${entry.kind}\u0000${entry.id}`);
-    }
-
-    for (const [channelId, state] of history) {
-      for (const [id] of state.deleted) {
-        if (!keep.has(`${channelId}\u0000deleted\u0000${id}`)) state.deleted.delete(id);
-      }
-      for (const [id] of state.edited) {
-        if (!keep.has(`${channelId}\u0000edited\u0000${id}`)) state.edited.delete(id);
-      }
-      if (!state.deleted.size && !state.edited.size) history.delete(channelId);
-    }
+    messageHistory.enforceLimits(history, {maxPerChannel: MAX_PER_CHANNEL, maxTotal: MAX_TOTAL});
   }
 
   // ---------------------------------------------------------------------------
@@ -907,74 +855,13 @@
   // ---------------------------------------------------------------------------
 
   function serializeHistory() {
-    const channels = {};
-    for (const [channelId, state] of history) {
-      if (!state.deleted.size && !state.edited.size) continue;
-      channels[channelId] = {
-        deleted: Array.from(state.deleted.values()),
-        edited: Array.from(state.edited.values()),
-      };
-    }
-    return {version: 1, savedAt: Date.now(), channels};
-  }
-
-  function normaliseRecord(record, channelId, kind) {
-    if (!record || !record.id) return null;
-    const id = String(record.id);
-    const message = record.message && typeof record.message === 'object' ? record.message : {};
-    const resolvedChannel = String(record.channelId || record.channel_id || message.channel_id || channelId || '');
-    if (!resolvedChannel) return null;
-    return {
-      ...record,
-      id,
-      channelId: resolvedChannel,
-      message: {
-        ...message,
-        id: message.id || id,
-        channel_id: message.channel_id || resolvedChannel,
-        content: message.content ?? record.content ?? '',
-        attachments: Array.isArray(message.attachments) ? message.attachments : [],
-        embeds: Array.isArray(message.embeds) ? message.embeds : [],
-        author: message.author || {},
-      },
-      content: record.content ?? message.content ?? '',
-      renderedContentHtml: record.renderedContentHtml || '',
-      richHtml: record.richHtml || '',
-      replyHtml: record.replyHtml || '',
-      avatarUrl: record.avatarUrl || '',
-      authorColor: record.authorColor || '',
-      deletedAt: kind === 'deleted' ? Number(record.deletedAt) || Date.now() : 0,
-      editedAt: kind === 'edited' ? Number(record.editedAt) || Date.now() : 0,
-      originalContent: record.originalContent || '',
-      originalHtml: record.originalHtml || '',
-      edits: Array.isArray(record.edits) ? record.edits : [],
-    };
+    return messageHistory.serializeHistory(history);
   }
 
   function importHistory(data) {
-    if (!data || typeof data !== 'object' || !data.channels) return;
-    let changed = false;
-    for (const [channelId, group] of Object.entries(data.channels)) {
-      if (!group || typeof group !== 'object') continue;
-      const state = channelState(channelId);
-
-      for (const raw of Array.isArray(group.deleted) ? group.deleted : []) {
-        const record = normaliseRecord(raw, channelId, 'deleted');
-        if (!record || state.deleted.has(record.id)) continue;
-        state.deleted.set(record.id, record);
-        changed = true;
-      }
-      for (const raw of Array.isArray(group.edited) ? group.edited : []) {
-        const record = normaliseRecord(raw, channelId, 'edited');
-        if (!record || state.edited.has(record.id)) continue;
-        state.edited.set(record.id, record);
-        changed = true;
-      }
-    }
-    if (changed) {
-      enforceLimits();
-      scheduleSync();
-    }
+    if (!messageHistory.importHistory(history, data)) return;
+    enforceLimits();
+    scheduleSync();
   }
 
   async function loadPersisted() {
@@ -988,26 +875,48 @@
     }
   }
 
-  async function saveNow(force = false) {
-    if (!persist || (stopped && !force)) return;
+  function saveNow(force = false) {
+    if (!persist || (stopped && !force)) return Promise.resolve();
     const bridge = window.refluxBridge;
-    if (!bridge?.writePluginData) return;
+    if (!bridge?.writePluginData) return Promise.resolve();
     if (saveInFlight) {
       saveAgain = true;
-      return;
+      return savePromise ?? Promise.resolve();
     }
     saveInFlight = true;
-    try {
-      await bridge.writePluginData(PLUGIN_DATA_NAME, serializeHistory());
-    } catch (err) {
-      console.warn(`${TAG} Could not save history:`, err);
-    } finally {
-      saveInFlight = false;
-      if (saveAgain) {
-        saveAgain = false;
-        saveSoon();
+    savePromise = (async () => {
+      try {
+        await bridge.writePluginData(PLUGIN_DATA_NAME, serializeHistory());
+      } catch (err) {
+        console.warn(`${TAG} Could not save history:`, err);
+      } finally {
+        saveInFlight = false;
+        savePromise = null;
+        if (saveAgain) {
+          saveAgain = false;
+          if (!stopped) saveSoon();
+        }
       }
+    })();
+    return savePromise;
+  }
+
+  /**
+   * Wait for any in-flight write, then write the current snapshot once more.
+   * stop() awaits this so hot reload cannot lose a pending debounced save.
+   */
+  async function flushPersistence() {
+    if (!persist) return;
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = null;
     }
+    while (saveInFlight && savePromise) {
+      try { await savePromise; }
+      catch { /* saveNow logs write failures */ }
+    }
+    saveAgain = false;
+    await saveNow(true);
   }
 
   function saveSoon() {
@@ -1340,13 +1249,12 @@
     console.log(`${TAG} Started. Persistence: ${persist ? 'on' : 'off'}`);
   }
 
-  function stop() {
+  async function stop() {
     if (stopped) return;
     stopped = true;
 
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = null;
-    if (persist) void saveNow(true);
 
     if (syncTimer) clearTimeout(syncTimer);
     syncTimer = null;
@@ -1366,13 +1274,17 @@
     }
 
     removeAllGhosts();
-    history.clear();
     removeCss?.();
     removeCss = null;
 
     started = false;
-    window.__reflux_messageLogger_loaded = false;
-    console.log(`${TAG} Stopped.`);
+    try {
+      await flushPersistence();
+    } finally {
+      history.clear();
+      window.__reflux_messageLogger_loaded = false;
+      console.log(`${TAG} Stopped.`);
+    }
   }
 
   window.__reflux.pluginManager.register({

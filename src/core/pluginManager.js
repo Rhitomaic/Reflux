@@ -17,8 +17,8 @@
  *     name:        string          — unique id, used as the settings key
  *     description: string
  *     rendererSrc: string|null     — path to the renderer-side plugin JS to inject (or null)
- *     start():     void            — called when plugin enabled (main-process side)
- *     stop():      void            — called when plugin disabled / Reflux unloads
+ *     start():     void|Promise<void> — called when plugin enabled (main-process side)
+ *     stop():      void|Promise<void> — called when plugin disabled / Reflux unloads
  *   }
  *
  * Per-plugin enabled state: `plugins.<name>.enabled` (default: true).
@@ -106,7 +106,7 @@ function _loadPlugin(pluginDir) {
 /**
  * Discover and start all enabled plugins.
  */
-function loadAll() {
+async function loadAll() {
   if (!fs.existsSync(PLUGINS_DIR)) {
     console.warn('[Reflux:PluginManager] plugins dir not found:', PLUGINS_DIR);
     return;
@@ -127,7 +127,7 @@ function loadAll() {
     _registry.set(name, { module: plugin, started: false });
 
     if (_isEnabled(name)) {
-      startPlugin(name);
+      await startPlugin(name);
     } else {
       console.log(`[Reflux:PluginManager] "${name}" disabled — skipping.`);
     }
@@ -146,54 +146,76 @@ function _registerPluginIpc(plugin) {
   }
 }
 
-function startPlugin(name) {
+async function startPlugin(name) {
   const entry = _registry.get(name);
   if (!entry || entry.started) return;
-  try {
-    _registerPluginIpc(entry.module);
-    entry.module.start();
-    entry.started = true;
-    console.log(`[Reflux:PluginManager] Started "${name}".`);
-  } catch (err) {
-    pluginIpc.removePlugin(name);
-    console.error(`[Reflux:PluginManager] "${name}".start() threw:`, err);
-  }
+  if (entry.stopping) await entry.stopping;
+  if (entry.started) return;
+  if (entry.starting) return entry.starting;
+  const promise = (async () => {
+    try {
+      _registerPluginIpc(entry.module);
+      await entry.module.start();
+      entry.started = true;
+      console.log(`[Reflux:PluginManager] Started "${name}".`);
+    } catch (err) {
+      pluginIpc.removePlugin(name);
+      entry.started = false;
+      console.error(`[Reflux:PluginManager] "${name}".start() threw:`, err);
+    }
+  })();
+  entry.starting = promise;
+  try { await promise; }
+  finally { entry.starting = null; }
 }
 
-function stopPlugin(name) {
+async function stopPlugin(name) {
   const entry = _registry.get(name);
-  if (!entry || !entry.started) {
+  if (!entry) {
     pluginIpc.removePlugin(name);
     return;
   }
-  try {
-    entry.module.stop();
-    entry.started = false;
-    console.log(`[Reflux:PluginManager] Stopped "${name}".`);
-  } catch (err) {
-    console.error(`[Reflux:PluginManager] "${name}".stop() threw:`, err);
-  } finally {
+  if (entry.starting) await entry.starting;
+  if (entry.stopping) return entry.stopping;
+  if (!entry.started) {
     pluginIpc.removePlugin(name);
+    return;
   }
+  const promise = (async () => {
+    try {
+      // stop() may be synchronous or return a Promise. Awaiting both shapes
+      // lets plugins flush persistence before hot reload replaces them.
+      await entry.module.stop();
+      console.log(`[Reflux:PluginManager] Stopped "${name}".`);
+    } catch (err) {
+      console.error(`[Reflux:PluginManager] "${name}".stop() threw:`, err);
+    } finally {
+      entry.started = false;
+      pluginIpc.removePlugin(name);
+    }
+  })();
+  entry.stopping = promise;
+  try { await promise; }
+  finally { entry.stopping = null; }
 }
 
-function stopAll() {
-  for (const name of _registry.keys()) stopPlugin(name);
+async function stopAll() {
+  await Promise.allSettled(Array.from(_registry.keys(), (name) => stopPlugin(name)));
 }
 
 /**
  * Load a plugin directory that was added after startup.
  * @param {string} pluginDir
- * @returns {object|null}
+ * @returns {Promise<object|null>}
  */
-function loadDirectory(pluginDir) {
+async function loadDirectory(pluginDir) {
   const known = nameForDirectory(pluginDir);
   if (known) return _registry.get(known)?.module ?? null;
   const plugin = _loadPlugin(pluginDir);
   if (!plugin) return null;
   if (_registry.has(plugin.name)) return _registry.get(plugin.name)?.module ?? null;
   _registry.set(plugin.name, {module: plugin, started: false, dir: pluginDir});
-  if (_isEnabled(plugin.name)) startPlugin(plugin.name);
+  if (_isEnabled(plugin.name)) await startPlugin(plugin.name);
   return plugin;
 }
 
@@ -202,9 +224,9 @@ function loadDirectory(pluginDir) {
  * Renderer re-injection is handled by the caller.
  *
  * @param {string} name
- * @returns {{name: string, plugin: object|null, enabled: boolean, started: boolean, error?: string}|null}
+ * @returns {Promise<{name: string, plugin: object|null, enabled: boolean, started: boolean, error?: string}|null>}
  */
-function reload(name) {
+async function reload(name) {
   const entry = _registry.get(name);
   if (!entry) return null;
 
@@ -214,7 +236,7 @@ function reload(name) {
   const wasEnabled = _isEnabled(name);
   const wasStarted = entry.started;
   const indexPath = path.join(pluginDir, 'index.js');
-  stopPlugin(name);
+  await stopPlugin(name);
   try { delete require.cache[require.resolve(indexPath)]; }
   catch { /* not cached */ }
 
@@ -222,7 +244,7 @@ function reload(name) {
   if (!next || next.name !== name) {
     // Keep the previous module available if the edited file is invalid.
     _registry.set(name, entry);
-    if (wasEnabled && wasStarted) startPlugin(name);
+    if (wasEnabled && wasStarted) await startPlugin(name);
     return {
       name,
       plugin: entry.module,
@@ -233,7 +255,7 @@ function reload(name) {
   }
 
   _registry.set(name, {module: next, started: false, dir: pluginDir});
-  if (wasEnabled) startPlugin(name);
+  if (wasEnabled) await startPlugin(name);
   console.log(`[Reflux:PluginManager] Reloaded "${name}".`);
   return {
     name,
@@ -258,14 +280,14 @@ function nameForDirectory(pluginDir) {
   return null;
 }
 
-function enablePlugin(name) {
+async function enablePlugin(name) {
   settings.set(`plugins.${name}.enabled`, true);
-  startPlugin(name);
+  await startPlugin(name);
 }
 
-function disablePlugin(name) {
+async function disablePlugin(name) {
   settings.set(`plugins.${name}.enabled`, false);
-  stopPlugin(name);
+  await stopPlugin(name);
 }
 
 function list() {
@@ -302,7 +324,7 @@ function registerIpc(ipcMain, { onRendererEnable, onRendererDisable, onRendererR
   ipcMain.handle(IPC_CH.LIST, () => list());
 
   ipcMain.handle(IPC_CH.ENABLE, async (_e, name) => {
-    enablePlugin(name);
+    await enablePlugin(name);
     const entry = _registry.get(name);
     if (onRendererEnable && entry?.module.rendererSrc) {
       await onRendererEnable(entry.module).catch(err =>
@@ -311,7 +333,7 @@ function registerIpc(ipcMain, { onRendererEnable, onRendererDisable, onRendererR
   });
 
   ipcMain.handle(IPC_CH.DISABLE, async (_e, name) => {
-    disablePlugin(name);
+    await disablePlugin(name);
     if (onRendererDisable) {
       await onRendererDisable(name).catch(err =>
         console.error(`[Reflux:PluginManager] onRendererDisable("${name}") threw:`, err));
@@ -319,7 +341,7 @@ function registerIpc(ipcMain, { onRendererEnable, onRendererDisable, onRendererR
   });
 
   ipcMain.handle(IPC_CH.RELOAD, async (_e, name) => {
-    const result = reload(name);
+    const result = await reload(name);
     if (result?.enabled && !result.error && onRendererReload) {
       await onRendererReload(result.plugin).catch(err =>
         console.error(`[Reflux:PluginManager] onRendererReload("${name}") threw:`, err));

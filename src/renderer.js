@@ -61,6 +61,36 @@
     console.error('[Reflux] pluginSchema.js was not injected before renderer.js; using fallback schema helpers.');
   }
 
+  // Shared safe HTML helper. The fallback only escapes text; it is here so a
+  // partially injected renderer never inserts unsanitised markup.
+  const safeHtml = window.__refluxSafeHtml?.createSanitizer?.(document) ?? {
+    sanitize(value) {
+      return String(value ?? '').replace(/[&<>"']/g, (character) => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;',
+      }[character]));
+    },
+    set(element, value) {
+      if (element) element.textContent = String(value ?? '');
+      return element;
+    },
+    escape(value) {
+      return String(value ?? '').replace(/[&<>"']/g, (character) => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;',
+      }[character]));
+    },
+  };
+  if (!window.__refluxSafeHtml) {
+    console.error('[Reflux] safeHtml.js was not injected before renderer.js; using a text-only fallback.');
+  }
+
   // ---------------------------------------------------------------------------
   // Mini event emitter
   // ---------------------------------------------------------------------------
@@ -5036,7 +5066,8 @@
      *
      * `plugin.start()` may return a cleanup function (the legacy API) or the
      * plugin may provide `plugin.stop()`.  Both shapes are supported; the
-     * returned cleanup wins when both exist.
+     * returned cleanup wins when both exist.  Cleanup functions and `stop()`
+     * may return Promises; `unregister()` waits for them before resolving.
      *
      * @param {{ name: string, start: (patcher, api) => (Function|void), stop?: Function }} plugin
      */
@@ -5055,7 +5086,6 @@
         if (!plugin.patches) plugin.patches = patcher.createRegistry(plugin.name);
         if (!plugin.dataStore) plugin.dataStore = data.createStore(plugin.name);
       }
-      let cleanup = null;
       const cleanups = [];
       try {
         const extensionCleanup = installPluginMessageExtensions(plugin);
@@ -5072,11 +5102,16 @@
 
         const result = plugin.start?.(patcher, __reflux);
         if (typeof result === 'function') cleanups.push(result);
-        else if (typeof plugin.stop === 'function') cleanups.push(() => plugin.stop());
+        else {
+          if (result && typeof result.catch === 'function') {
+            result.catch((err) => console.error(`[Reflux] "${plugin.name}" async start() threw:`, err));
+          }
+          if (typeof plugin.stop === 'function') cleanups.push(() => plugin.stop());
+        }
 
-        cleanup = () => {
+        const cleanup = async () => {
           for (const fn of cleanups.reverse()) {
-            try { fn(); }
+            try { await fn(); }
             catch (err) { console.error(`[Reflux] "${plugin.name}" cleanup threw:`, err); }
           }
         };
@@ -5084,21 +5119,27 @@
         console.log(`[Reflux] Plugin "${plugin.name}" started.`);
       } catch (err) {
         for (const fn of cleanups.reverse()) {
-          try { fn(); } catch { /* best effort */ }
+          try {
+            const cleanupResult = fn();
+            cleanupResult?.catch?.((cleanupError) =>
+              console.error(`[Reflux] "${plugin.name}" cleanup threw:`, cleanupError));
+          } catch { /* best effort */ }
         }
         console.error(`[Reflux] Plugin "${plugin.name}" failed to start:`, err);
       }
     },
 
-    unregister(name) {
+    async unregister(name) {
       const entry = _plugins.get(name);
       if (!entry) {
         pluginIpcRemoveAll(name);
         return;
       }
-      try { entry.cleanup?.(); } catch (err) { console.error(`[Reflux] "${name}" stop() threw:`, err); }
+      // Remove the entry first so a second unregister cannot run cleanup twice.
       _plugins.delete(name);
-      pluginIpcRemoveAll(name);
+      try { await entry.cleanup?.(); }
+      catch (err) { console.error(`[Reflux] "${name}" stop() threw:`, err); }
+      finally { pluginIpcRemoveAll(name); }
     },
 
     async reload(name) {
@@ -5146,6 +5187,9 @@
     pluginIpc,
     definePlugin,
     OptionType,
+    html: safeHtml,
+    pluginMetadata: window.__refluxPluginMetadata ?? null,
+    messageHistory: window.__refluxMessageHistory ?? null,
     react: reactApi,
     components,
   };
