@@ -55,6 +55,16 @@ Or, from the repository root:
 node installer/cli/index.js
 ```
 
+For convenience, the root package exposes the same flow as npm scripts:
+
+```bash
+npm run cli          # install / repair the current Fluxer instance
+npm run update-dev   # same as above, for local development
+npm run unpatch      # restore Fluxer's original app.asar
+```
+
+Restart Fluxer after running an install/update command.
+
 Reflux searches the usual Fluxer locations automatically:
 
 - **Windows**: `%LOCALAPPDATA%\fluxer_app`, `%LOCALAPPDATA%\Fluxer`, and Canary equivalents

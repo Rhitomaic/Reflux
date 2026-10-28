@@ -1,6 +1,11 @@
 {
 	"name": "fluxer",
 	"private": true,
+	"scripts": {
+		"cli": "node installer/cli/index.js",
+		"update-dev": "npm run cli",
+		"unpatch": "node installer/cli/unpatch.js"
+	},
 	"prettier": {
 		"bracketSpacing": false,
 		"printWidth": 120,

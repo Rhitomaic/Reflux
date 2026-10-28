@@ -80,12 +80,23 @@
     element.type = 'button';
     element.textContent = label;
     element.style.cssText = [
-      'border:0', 'border-radius:4px', 'padding:5px 8px', 'cursor:pointer',
+      'border:0', 'border-radius:4px', 'padding:5px 8px', 'cursor:pointer', 'z-index:2147483646',
+      '-webkit-app-region:no-drag',
       'background:var(--background-modifier-accent,#4e5058)',
       'color:var(--text-normal,#dbdee1)', 'font-size:12px',
     ].join(';');
     element.addEventListener('click', onClick);
     return element;
+  }
+
+  function setPanelOpen(open) {
+    if (!panel) return;
+    panel.hidden = !open;
+    panel.style.display = open ? 'flex' : 'none';
+    if (launcher) {
+      launcher.hidden = Boolean(open);
+      launcher.style.display = open ? 'none' : '';
+    }
   }
 
   function buildPanel() {
@@ -94,8 +105,9 @@
     panel.hidden = true;
     panel.style.cssText = [
       'position:fixed', 'right:16px', 'bottom:16px', 'z-index:2147483646',
+      '-webkit-app-region:no-drag',
       'width:min(720px,calc(100vw - 32px))', 'height:min(520px,calc(100vh - 32px))',
-      'display:flex', 'flex-direction:column', 'gap:8px', 'padding:12px',
+      'display:none', 'flex-direction:column', 'gap:8px', 'padding:12px',
       'box-sizing:border-box', 'border:1px solid var(--background-modifier-accent,#4e5058)',
       'border-radius:8px', 'background:var(--background-secondary,#313338)',
       'box-shadow:0 8px 32px rgba(0,0,0,.45)', 'color:var(--text-normal,#dbdee1)',
@@ -109,7 +121,7 @@
     title.style.flex = '1';
     countLabel = document.createElement('span');
     countLabel.style.cssText = 'font-size:11px;color:var(--text-muted,#949ba4);';
-    header.append(title, countLabel, button('Close', () => { panel.hidden = true; }));
+    header.append(title, countLabel, button('Close', () => setPanelOpen(false)));
 
     const controls = document.createElement('div');
     controls.style.cssText = 'display:flex;align-items:center;gap:8px;flex-wrap:wrap;';
@@ -155,12 +167,14 @@
   }
 
   function buildLauncher() {
-    launcher = button('DBG', () => { panel.hidden = !panel.hidden; });
+    launcher = button('DBG', () => setPanelOpen(panel.hidden));
     launcher.id = 'reflux-debug-tools-launcher';
     launcher.title = 'Open Reflux Gateway Debug';
     launcher.style.cssText += [
-      'position:fixed', 'left:16px', 'top:16px', 'z-index:2147483645',
-      'font-weight:700', 'letter-spacing:.4px', 'box-shadow:0 4px 12px rgba(0,0,0,.3)',
+      'position:fixed', 'right:12px', 'top:50%', 'transform:translateY(-50%)',
+      'z-index:2147483645', 'padding:8px 7px', 'border-radius:8px',
+      '-webkit-app-region:no-drag', 'pointer-events:auto', 'user-select:none',
+      'font-weight:700', 'letter-spacing:.4px', 'box-shadow:0 4px 14px rgba(0,0,0,.35)',
     ].join(';');
     document.body.appendChild(launcher);
   }
