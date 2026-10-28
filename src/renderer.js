@@ -2504,6 +2504,772 @@
   })();
 
   // ---------------------------------------------------------------------------
+  // Native Fluxer context-menu bridge
+  // ---------------------------------------------------------------------------
+
+  const NATIVE_CONTEXT_PATCH = Symbol('refluxNativeContextPatch');
+  const NATIVE_OPEN_METHODS = [
+    'openFromEvent',
+    'openAtPoint',
+    'openForElement',
+    'openAboveElementBottomLeft',
+    'openAboveElementBottomRight',
+    'openFromElementBottomRight',
+    'openFromElementLeftStart',
+  ];
+
+  /** @type {Set<Function|object>} */
+  const _nativeMenuProviders = new Set();
+  let _nativeMenuModule = null;
+  let _nativeMenuWatcher = null;
+  let _nativeMenuGroupCache;
+
+  function _nativeMenuPredicate(value) {
+    return value &&
+      typeof value.openFromEvent === 'function' &&
+      typeof value.openAtPoint === 'function' &&
+      typeof value.close === 'function';
+  }
+
+  function _nativeMenuTarget(value) {
+    if (!value) return null;
+    if (typeof Element !== 'undefined' && value instanceof Element) {
+      try { return value.closest('button,[role="button"],a,[data-contextmenu-anchor="true"]') ?? value; }
+      catch { return value; }
+    }
+    const current = value.currentTarget;
+    if (current) return _nativeMenuTarget(current);
+    const direct = value.target;
+    if (direct && direct !== value) return _nativeMenuTarget(direct);
+    return null;
+  }
+
+  function _makeNativeMenuInfo(method, args) {
+    const first = args[0];
+    const event = method === 'openAtPoint' ? null : (first?.nativeEvent ?? first);
+    const target = method === 'openForElement'
+      ? _nativeMenuTarget(first)
+      : _nativeMenuTarget(event);
+    const point = method === 'openAtPoint' && Number.isFinite(first?.x) && Number.isFinite(first?.y)
+      ? {x: first.x, y: first.y}
+      : null;
+    return {
+      method,
+      event,
+      target,
+      point,
+      config: method === 'openAtPoint' ? args[2] : args[2],
+      module: _nativeMenuModule,
+      api: __reflux,
+    };
+  }
+
+  function _findNativeMenuGroup() {
+    if (_nativeMenuGroupCache) return _nativeMenuGroupCache;
+    let group = null;
+    const module = patcher.findByCode('ui.action-menu.menu-group.menu-group-primitive');
+    if (module) {
+      if (typeof module === 'function') group = module;
+      else {
+        for (const value of _nestedExportValues(module)) {
+          if (typeof value === 'function') { group = value; break; }
+        }
+      }
+    }
+    if (group) _nativeMenuGroupCache = group;
+    return group;
+  }
+
+  function _renderNativeMenuItem(item, info, key) {
+    if (!_react || !item) return null;
+    const React = _react;
+    if (React.isValidElement(item)) return React.cloneElement(item, {key});
+    if (item.type === 'separator') return null;
+
+    const MenuItem = findComponentNow('MenuItem');
+    if (!MenuItem) return null;
+    return React.createElement(
+      MenuItem,
+      {
+        key,
+        icon: item.icon,
+        danger: Boolean(item.danger),
+        disabled: Boolean(item.disabled),
+        hint: item.hint,
+        onClick: (event) => {
+          try { item.action?.(event, info?.target, info); }
+          catch (err) { console.error('[Reflux:ContextMenu] Native menu action threw:', err); }
+        },
+      },
+      item.label ?? item.name ?? '',
+    );
+  }
+
+  function _buildNativeGroups(items, info) {
+    if (!_react || !Array.isArray(items) || !items.length) return [];
+    const React = _react;
+    const MenuGroup = _findNativeMenuGroup();
+    const children = items
+      .map((item, index) => _renderNativeMenuItem(item, info, `reflux-native-${index}`))
+      .filter(Boolean);
+    if (!children.length) return [];
+
+    if (MenuGroup) {
+      return [React.createElement(MenuGroup, {key: 'reflux-native-group'}, ...children)];
+    }
+    return [React.createElement(React.Fragment, {key: 'reflux-native-group'}, ...children)];
+  }
+
+  function _collectNativeGroups(info) {
+    const groups = [];
+    for (const provider of _nativeMenuProviders) {
+      try {
+        const result = typeof provider === 'function'
+          ? provider(info)
+          : (provider.getItems?.(info) ?? (typeof provider.items === 'function' ? provider.items(info) : provider.items));
+        if (!result) continue;
+        const items = Array.isArray(result) ? result : result.items;
+        if (!Array.isArray(items) || !items.length) continue;
+        groups.push(..._buildNativeGroups(items, info));
+      } catch (err) {
+        console.error('[Reflux:ContextMenu] Native provider threw:', err);
+      }
+    }
+    return groups;
+  }
+
+  function _wrapNativeRender(originalRender, info, api) {
+    let original;
+    try { original = originalRender(api); }
+    catch (err) {
+      console.error('[Reflux:ContextMenu] Native menu render threw:', err);
+      return null;
+    }
+    const groups = _collectNativeGroups({...info, api});
+    if (!groups.length || !_react) return original;
+    return _react.createElement(_react.Fragment, null, original, ...groups);
+  }
+
+  function _patchNativeMenuModule(module) {
+    if (!module || !_nativeMenuPredicate(module)) return false;
+    _nativeMenuModule = module;
+
+    for (const method of NATIVE_OPEN_METHODS) {
+      const original = module[method];
+      if (typeof original !== 'function' || original[NATIVE_CONTEXT_PATCH]) continue;
+
+      const patched = function refluxNativeContextMenu(...args) {
+        if (typeof args[1] === 'function') {
+          const info = _makeNativeMenuInfo(method, args);
+          const originalRender = args[1];
+          args[1] = (api) => _wrapNativeRender(originalRender, info, api);
+        }
+        return original.apply(this, args);
+      };
+      try {
+        Object.defineProperty(patched, NATIVE_CONTEXT_PATCH, {value: true});
+        module[method] = patched;
+      } catch (err) {
+        console.warn(`[Reflux:ContextMenu] Could not patch native ${method}:`, err);
+      }
+    }
+    return true;
+  }
+
+  function _ensureNativeMenuPatch() {
+    if (!_nativeMenuModule) {
+      const found = _firstNestedExport(_nativeMenuPredicate);
+      if (found?.value) _patchNativeMenuModule(found.value);
+    }
+
+    if (!_nativeMenuWatcher) {
+      _nativeMenuWatcher = patcher.patch(
+        (exports) => _nestedExportValues(exports).some(_nativeMenuPredicate),
+        (exports) => {
+          for (const value of _nestedExportValues(exports)) {
+            if (_nativeMenuPredicate(value)) _patchNativeMenuModule(value);
+          }
+          return exports;
+        },
+      );
+    }
+    return Boolean(_nativeMenuModule);
+  }
+
+  const nativeContextMenu = {
+    get available() { return _ensureNativeMenuPatch(); },
+    get module() { _ensureNativeMenuPatch(); return _nativeMenuModule; },
+
+    patch(provider) {
+      if (!provider) return () => {};
+      _nativeMenuProviders.add(provider);
+      _ensureNativeMenuPatch();
+      return () => _nativeMenuProviders.delete(provider);
+    },
+    register(provider) { return this.patch(provider); },
+
+    openFromEvent(event, render, config) {
+      if (_ensureNativeMenuPatch()) return _nativeMenuModule.openFromEvent(event, render, config);
+      return null;
+    },
+    openAtPoint(point, render, config) {
+      if (_ensureNativeMenuPatch()) return _nativeMenuModule.openAtPoint(point, render, config);
+      return null;
+    },
+    openForElement(element, render, options) {
+      if (_ensureNativeMenuPatch()) return _nativeMenuModule.openForElement(element, render, options);
+      return null;
+    },
+    close() {
+      if (!_ensureNativeMenuPatch()) return;
+      try { _nativeMenuModule.close(); } catch { /* already closed */ }
+    },
+
+    /**
+     * Open a native menu from the same item shape used by contextMenu.register.
+     * Falls back to Reflux's DOM menu when Fluxer's menu module is unavailable.
+     */
+    open(items, {x = 0, y = 0, target = null} = {}) {
+      const list = Array.isArray(items) ? items.filter(Boolean) : [];
+      if (!list.length) return null;
+      if (_ensureNativeMenuPatch() && _react) {
+        return _nativeMenuModule.openAtPoint(
+          {x, y},
+          () => {
+            const groups = _buildNativeGroups(list, {target, method: 'manual', api: __reflux});
+            return _react.createElement(_react.Fragment, null, ...groups);
+          },
+          {returnFocusTarget: target},
+        );
+      }
+      return contextMenu.open(list, {x, y, target});
+    },
+  };
+
+  contextMenu.native = nativeContextMenu;
+  contextMenu.patchNative = (provider) => nativeContextMenu.patch(provider);
+  contextMenu.openNative = (items, options) => nativeContextMenu.open(items, options);
+
+  _ensureNativeMenuPatch();
+  onWebpackReady(() => _ensureNativeMenuPatch());
+
+  // ---------------------------------------------------------------------------
+  // Notices, modals and toasts
+  // ---------------------------------------------------------------------------
+
+  const FEEDBACK_CSS = `
+    .reflux-notice-stack {
+      display: flex;
+      flex-direction: column;
+      gap: .375rem;
+      width: 100%;
+      box-sizing: border-box;
+    }
+    .reflux-notice-stack[data-reflux-floating="true"] {
+      position: fixed;
+      inset: 0 0 auto 0;
+      z-index: 2147483000;
+      padding: .5rem;
+      pointer-events: none;
+    }
+    .reflux-notice {
+      display: flex;
+      align-items: flex-start;
+      gap: .625rem;
+      padding: .625rem .75rem;
+      box-sizing: border-box;
+      border: 1px solid var(--background-modifier-accent, rgba(255,255,255,.08));
+      border-radius: .5rem;
+      background: var(--background-secondary-alt, var(--background-floating, #2b2d31));
+      color: var(--text-primary, var(--text-normal, #dbdee1));
+      box-shadow: 0 .25rem .75rem rgba(0,0,0,.18);
+      font-size: .875rem;
+      line-height: 1.25rem;
+      pointer-events: auto;
+    }
+    .reflux-notice[data-reflux-floating="true"] {
+      max-width: min(38rem, calc(100vw - 1rem));
+      margin-inline: auto;
+      width: 100%;
+    }
+    .reflux-notice[data-type="success"] { border-color: color-mix(in srgb, var(--status-success, #23a55a) 45%, transparent); }
+    .reflux-notice[data-type="warning"] { border-color: color-mix(in srgb, var(--status-warning, #f0b232) 45%, transparent); }
+    .reflux-notice[data-type="danger"] { border-color: color-mix(in srgb, var(--status-danger, #f23f43) 45%, transparent); }
+    .reflux-notice-body {
+      min-width: 0;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: .125rem;
+    }
+    .reflux-notice-title {
+      font-weight: 600;
+    }
+    .reflux-notice-message {
+      color: var(--text-secondary, var(--text-normal, #dbdee1));
+      overflow-wrap: anywhere;
+    }
+    .reflux-notice-actions {
+      display: flex;
+      align-items: center;
+      gap: .375rem;
+      flex-shrink: 0;
+    }
+    .reflux-notice-button {
+      all: unset;
+      padding: .25rem .5rem;
+      border-radius: .25rem;
+      color: var(--text-link, #00a8fc);
+      font-weight: 500;
+      cursor: pointer;
+    }
+    .reflux-notice-button:hover,
+    .reflux-notice-button:focus-visible {
+      background: var(--background-modifier-hover, rgba(255,255,255,.06));
+      outline: none;
+    }
+    .reflux-notice-close {
+      all: unset;
+      flex-shrink: 0;
+      width: 1.5rem;
+      height: 1.5rem;
+      display: grid;
+      place-items: center;
+      border-radius: .25rem;
+      color: var(--text-tertiary-muted, var(--text-muted, #949ba4));
+      cursor: pointer;
+      font-size: 1rem;
+      line-height: 1;
+    }
+    .reflux-notice-close:hover,
+    .reflux-notice-close:focus-visible {
+      background: var(--background-modifier-hover, rgba(255,255,255,.06));
+      color: var(--text-primary, var(--text-normal, #fff));
+      outline: none;
+    }
+    .reflux-toast-stack {
+      position: fixed;
+      right: 1rem;
+      bottom: 1rem;
+      z-index: 2147483001;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: .5rem;
+      pointer-events: none;
+    }
+    .reflux-toast {
+      display: flex;
+      align-items: center;
+      gap: .5rem;
+      max-width: min(24rem, calc(100vw - 2rem));
+      padding: .625rem .75rem;
+      box-sizing: border-box;
+      border: 1px solid var(--background-modifier-accent, rgba(255,255,255,.08));
+      border-radius: .5rem;
+      background: var(--background-floating, #313338);
+      color: var(--text-primary, var(--text-normal, #dbdee1));
+      box-shadow: 0 .5rem 1rem rgba(0,0,0,.24);
+      font-size: .875rem;
+      line-height: 1.25rem;
+      pointer-events: auto;
+    }
+    .reflux-toast[data-type="success"] { color: var(--status-success, #23a55a); }
+    .reflux-toast[data-type="danger"],
+    .reflux-toast[data-type="error"] { color: var(--status-danger, #f23f43); }
+    .reflux-toast[data-type="warning"] { color: var(--status-warning, #f0b232); }
+    .reflux-modal-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 2147483002;
+      display: grid;
+      place-items: center;
+      padding: 1rem;
+      box-sizing: border-box;
+      background: rgba(0,0,0,.55);
+    }
+    .reflux-modal-panel {
+      width: min(30rem, calc(100vw - 2rem));
+      max-height: calc(100vh - 2rem);
+      overflow: auto;
+      padding: 1rem;
+      box-sizing: border-box;
+      border: 1px solid var(--background-modifier-accent, rgba(255,255,255,.08));
+      border-radius: .5rem;
+      background: var(--background-floating, #313338);
+      color: var(--text-primary, var(--text-normal, #dbdee1));
+      box-shadow: 0 1rem 2rem rgba(0,0,0,.35);
+    }
+  `;
+
+  let _feedbackCssInstalled = false;
+  function ensureFeedbackCss() {
+    if (_feedbackCssInstalled) return;
+    _feedbackCssInstalled = true;
+    ui.injectCSS('feedback', FEEDBACK_CSS);
+  }
+
+  function _renderFeedbackContent(container, content, props) {
+    if (!container) return;
+    try {
+      if (typeof content === 'function') content = content(props);
+    } catch (err) {
+      console.error('[Reflux:Feedback] Content renderer threw:', err);
+      container.textContent = 'Something went wrong rendering this content.';
+      return;
+    }
+
+    if (_react && _react.isValidElement(content)) {
+      reactApi.render(
+        _react.createElement(components.ErrorBoundary, {name: 'Reflux feedback'}, content),
+        container,
+      );
+      return;
+    }
+    if (typeof Node !== 'undefined' && content instanceof Node) {
+      reactApi.unmount(container);
+      container.replaceChildren(content);
+      return;
+    }
+    reactApi.unmount(container);
+    container.textContent = content === undefined || content === null ? '' : String(content);
+  }
+
+  let _noticeStack = null;
+  let _noticeStackFloating = false;
+  let _toastStack = null;
+
+  function _noticeHost() {
+    const nagbar = document.querySelector('[data-flx="app.app-layout.nagbar-container.container"]');
+    if (nagbar) return {parent: nagbar, floating: false};
+    return {parent: document.body, floating: true};
+  }
+
+  function _ensureNoticeStack() {
+    ensureFeedbackCss();
+    const host = _noticeHost();
+    if (!_noticeStack || !_noticeStack.isConnected || _noticeStack.parentNode !== host.parent || _noticeStackFloating !== host.floating) {
+      if (_noticeStack) {
+        for (const notice of Array.from(_noticeStack.children)) {
+          const body = notice.querySelector?.('.reflux-notice-body');
+          if (body) reactApi.unmount(body);
+        }
+        _noticeStack.remove();
+      }
+      _noticeStack = document.createElement('div');
+      _noticeStack.className = 'reflux-notice-stack';
+      _noticeStack.dataset.refluxFloating = String(host.floating);
+      _noticeStackFloating = host.floating;
+      host.parent.appendChild(_noticeStack);
+    }
+    return _noticeStack;
+  }
+
+  function _ensureToastStack() {
+    ensureFeedbackCss();
+    if (!_toastStack || !_toastStack.isConnected) {
+      _toastStack = document.createElement('div');
+      _toastStack.className = 'reflux-toast-stack';
+      document.body.appendChild(_toastStack);
+    }
+    return _toastStack;
+  }
+
+  function _normalizeFeedbackOptions(content, options) {
+    const opts = options && typeof options === 'object' ? {...options} : {};
+    if (content && typeof content === 'object' && !(typeof Node !== 'undefined' && content instanceof Node) &&
+        !(_react && _react.isValidElement(content)) && ('title' in content || 'message' in content)) {
+      return {
+        ...opts,
+        title: content.title ?? opts.title,
+        message: content.message ?? opts.message,
+        content: content.content ?? opts.content,
+        actions: content.actions ?? opts.actions,
+      };
+    }
+    return {...opts, content};
+  }
+
+  function _makeFeedbackButton(label, onClick, className = 'reflux-notice-button') {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = className;
+    button.textContent = String(label ?? '');
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      try { onClick?.(event); }
+      catch (err) { console.error('[Reflux:Feedback] Action threw:', err); }
+    });
+    return button;
+  }
+
+  const notices = {
+    show(content, options = {}) {
+      const opts = _normalizeFeedbackOptions(content, options);
+      const stack = _ensureNoticeStack();
+      const floating = _noticeStackFloating;
+      const notice = document.createElement('div');
+      notice.className = 'reflux-notice';
+      notice.dataset.type = String(opts.type ?? 'info');
+      notice.dataset.refluxFloating = String(floating);
+      notice.setAttribute('role', opts.type === 'danger' ? 'alert' : 'status');
+
+      const body = document.createElement('div');
+      body.className = 'reflux-notice-body';
+      if (opts.title) {
+        const title = document.createElement('div');
+        title.className = 'reflux-notice-title';
+        title.textContent = String(opts.title);
+        body.appendChild(title);
+      }
+      const message = document.createElement('div');
+      message.className = 'reflux-notice-message';
+      body.appendChild(message);
+      notice.appendChild(body);
+
+      let closed = false;
+      let timer = null;
+      const close = () => {
+        if (closed) return;
+        closed = true;
+        if (timer) clearTimeout(timer);
+        reactApi.unmount(message);
+        notice.remove();
+        if (_noticeStack && !_noticeStack.children.length) {
+          _noticeStack.remove();
+          _noticeStack = null;
+        }
+      };
+
+      const actions = Array.isArray(opts.actions) ? opts.actions : [];
+      if (actions.length || opts.dismissible !== false) {
+        const actionBar = document.createElement('div');
+        actionBar.className = 'reflux-notice-actions';
+        for (const action of actions) {
+          if (!action) continue;
+          actionBar.appendChild(_makeFeedbackButton(
+            action.label ?? action.name ?? 'Action',
+            (event) => {
+              const result = action.action?.(event, close);
+              if (result !== false && action.closeOnClick !== false) close();
+            },
+          ));
+        }
+        if (opts.dismissible !== false) {
+          actionBar.appendChild(_makeFeedbackButton('×', close, 'reflux-notice-close'));
+        }
+        notice.appendChild(actionBar);
+      }
+
+      stack.appendChild(notice);
+      _renderFeedbackContent(message, opts.content ?? opts.message ?? '', {
+        close,
+        ...opts,
+      });
+
+      if (Number.isFinite(opts.timeout) && opts.timeout > 0) timer = setTimeout(close, opts.timeout);
+      return {element: notice, close, id: opts.id ?? null};
+    },
+
+    close(handleOrElement) {
+      if (!handleOrElement) return;
+      if (typeof handleOrElement.close === 'function') handleOrElement.close();
+      else if (handleOrElement instanceof Element) handleOrElement.remove();
+    },
+
+    clear() {
+      if (!_noticeStack) return;
+      for (const child of Array.from(_noticeStack.children)) {
+        const body = child.querySelector?.('.reflux-notice-body');
+        if (body) reactApi.unmount(body);
+        child.remove();
+      }
+      _noticeStack.remove();
+      _noticeStack = null;
+    },
+
+    get available() { return true; },
+  };
+
+  let _toastManager = null;
+  function _findToastManager() {
+    if (_toastManager) return _toastManager;
+    const found = _firstNestedExport((value) =>
+      typeof value?.createToast === 'function' && typeof value?.destroyToast === 'function');
+    if (found?.value) _toastManager = found.value;
+    return _toastManager;
+  }
+
+  function _showFallbackToast(content, options = {}) {
+    const stack = _ensureToastStack();
+    const toast = document.createElement('div');
+    toast.className = 'reflux-toast';
+    toast.dataset.type = String(options.type ?? 'info');
+    toast.setAttribute('role', options.type === 'danger' || options.type === 'error' ? 'alert' : 'status');
+    stack.appendChild(toast);
+
+    let closed = false;
+    let timer = null;
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      if (timer) clearTimeout(timer);
+      reactApi.unmount(toast);
+      toast.remove();
+      if (_toastStack && !_toastStack.children.length) {
+        _toastStack.remove();
+        _toastStack = null;
+      }
+    };
+
+    _renderFeedbackContent(toast, content, {close, ...options});
+    if (Number.isFinite(options.timeout) && options.timeout > 0) timer = setTimeout(close, options.timeout);
+    return {element: toast, close, id: null};
+  }
+
+  const toasts = {
+    show(content, options = {}) {
+      const opts = {type: 'info', timeout: 3000, ...options};
+      const manager = _findToastManager();
+      if (manager) {
+        try {
+          const id = manager.createToast({
+            type: opts.type,
+            children: content,
+            timeout: opts.timeout,
+          });
+          return {
+            id,
+            close() { try { manager.destroyToast(id); } catch { /* already dismissed */ } },
+          };
+        } catch (err) {
+          console.warn('[Reflux:Toasts] Native toast failed; using fallback:', err);
+        }
+      }
+      return _showFallbackToast(content, opts);
+    },
+    success(content, options = {}) { return this.show(content, {...options, type: 'success'}); },
+    error(content, options = {}) { return this.show(content, {...options, type: 'error', timeout: options.timeout ?? 5000}); },
+    info(content, options = {}) { return this.show(content, {...options, type: 'info'}); },
+    warning(content, options = {}) { return this.show(content, {...options, type: 'warning'}); },
+    dismiss(handleOrId) {
+      if (handleOrId && typeof handleOrId.close === 'function') return handleOrId.close();
+      const manager = _findToastManager();
+      if (manager && typeof handleOrId === 'string') manager.destroyToast(handleOrId);
+    },
+    get available() { return Boolean(_findToastManager()); },
+  };
+
+  let _modalManager = null;
+  let _modalSeq = 0;
+  function _findModalManager() {
+    if (_modalManager) return _modalManager;
+    const found = _firstNestedExport((value) =>
+      typeof value?.push === 'function' &&
+      typeof value?.pop === 'function' &&
+      (typeof value?.hasModal === 'function' || typeof value?.getOrderedModals === 'function'));
+    if (found?.value) _modalManager = found.value;
+    return _modalManager;
+  }
+
+  const _fallbackModals = new Map();
+
+  function _showFallbackModal(element, options, key) {
+    ensureFeedbackCss();
+    const backdrop = document.createElement('div');
+    backdrop.className = 'reflux-modal-backdrop';
+    const panel = document.createElement('div');
+    panel.className = 'reflux-modal-panel';
+    backdrop.appendChild(panel);
+    document.body.appendChild(backdrop);
+
+    let closed = false;
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      _fallbackModals.delete(key);
+      reactApi.unmount(panel);
+      backdrop.remove();
+      options.onClose?.();
+    };
+    const onBackdrop = (event) => {
+      if (event.target === backdrop && options.dismissible !== false) close();
+    };
+    backdrop.addEventListener('pointerdown', onBackdrop);
+    _renderFeedbackContent(panel, element, {close, ...options});
+    _fallbackModals.set(key, {close, backdrop});
+    return {key, close};
+  }
+
+  const modals = {
+    open(element, options = {}) {
+      const opts = {...options};
+      const key = String(opts.key ?? opts.id ?? `reflux-modal-${++_modalSeq}`);
+      const manager = _findModalManager();
+      const React = _react;
+      let renderModal;
+
+      if (typeof element === 'function' && React) {
+        renderModal = () => React.createElement(element, {close: () => modals.close(key), ...opts});
+      } else if (React && typeof element === 'string') {
+        renderModal = () => React.createElement('div', null, element);
+      } else {
+        renderModal = () => element;
+      }
+
+      if (manager && React) {
+        try {
+          const modalRenderer = function refluxModal() { return renderModal(); };
+          if (opts.modalType) modalRenderer.modalType = opts.modalType;
+          manager.push(modalRenderer, key, {isBackground: Boolean(opts.isBackground)});
+          return {
+            key,
+            close() { try { manager.pop(key); } catch { /* already closed */ } },
+            update(nextElement) {
+              renderModal = typeof nextElement === 'function'
+                ? () => (React.isValidElement(nextElement) ? nextElement : React.createElement(nextElement, {close: () => modals.close(key), ...opts}))
+                : () => nextElement;
+              try { manager.update(key, () => modalRenderer); }
+              catch (err) { console.error('[Reflux:Modals] Native modal update failed:', err); }
+            },
+          };
+        } catch (err) {
+          console.warn('[Reflux:Modals] Native modal failed; using fallback:', err);
+        }
+      }
+      return _showFallbackModal(renderModal, opts, key);
+    },
+
+    close(handleOrKey) {
+      const key = typeof handleOrKey === 'object' && handleOrKey
+        ? handleOrKey.key
+        : handleOrKey;
+      if (key !== undefined && key !== null) {
+        if (_fallbackModals.has(String(key))) {
+          _fallbackModals.get(String(key))?.close();
+          return;
+        }
+        const manager = _findModalManager();
+        if (manager && typeof manager.pop === 'function') {
+          try { manager.pop(String(key)); return; } catch { /* fall through */ }
+        }
+      }
+      if (handleOrKey && typeof handleOrKey.close === 'function') handleOrKey.close();
+    },
+
+    closeAll() {
+      const manager = _findModalManager();
+      if (manager && typeof manager.popAll === 'function') {
+        try { manager.popAll(); } catch { /* ignore */ }
+      }
+      for (const entry of Array.from(_fallbackModals.values())) entry.close();
+    },
+
+    get available() { return Boolean(_findModalManager()) || Boolean(_react); },
+  };
+
+  // ---------------------------------------------------------------------------
   // Plugin registry (renderer-side)
   // ---------------------------------------------------------------------------
 
@@ -2580,6 +3346,9 @@
     gateway,
     stores,
     messages,
+    notices,
+    modals,
+    toasts,
     settings,
     definePlugin,
     OptionType,
