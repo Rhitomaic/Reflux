@@ -57,6 +57,10 @@ That's it. Reflux discovers and loads it automatically on the next Fluxer launch
 | `rendererSrc` | `string \| null` | | Absolute path to a renderer-side script injected into the Fluxer web context. |
 | `settings` | `object \| array` | | Optional settings schema. Object form is preferred; legacy arrays are normalized. See [Plugin settings](#plugin-settings). |
 | `settingsStore` | `object` | | Scoped settings store attached by Reflux before `start()`. Read/write and subscribe to settings here. |
+| `messageAccessories` | `array \| object` | | Message extension components rendered below each message. |
+| `messageDecorations` | `array \| object` | | Message extension components rendered alongside each message. |
+| `messageEvents` | `object` | | Optional `{create, update, delete, 'bulk-delete'}` handlers. |
+| `commands` | `array \| object` | | Slash commands registered by the plugin. See [Commands](#commands). |
 | `authors` | `array` | | Optional author metadata. |
 | `tags` | `string[]` | | Optional categories shown in the plugin UI. |
 | `dependencies` | `string[]` | | Names of plugins that must be enabled first. |
@@ -486,9 +490,9 @@ components.waitFor('Modal');    // wait for lazy-loaded modules
 ```
 
 The kit predefines getters for `Button`, `Switch`, `FormSwitch`, `FormInput`,
-`FormCombobox`, `Clickable`, `Flex`, `Text`, `Menu`, `Tooltip`, `Modal`, and
-`Spinner`. Availability depends on Fluxer's current build; always handle a
-`null` result.
+`FormCombobox`, `Clickable`, `Flex`, `Text`, `Menu`, `MenuItem`, `Tooltip`,
+`Modal`, and `Spinner`. Availability depends on Fluxer's current build; always
+handle a `null` result.
 
 ### ErrorBoundary
 
@@ -576,6 +580,263 @@ when to call `readPluginData()`.
 
 ---
 
+## Flux gateway events and store discovery
+
+Phase 2 exposes Fluxer's gateway dispatch stream on `window.__reflux.gateway` and
+`window.__reflux.flux`. Listeners run before Fluxer applies an event; use
+`gateway.after()` when you need Fluxer's stores to be up to date.
+
+```js
+const {gateway, flux} = window.__reflux;
+
+// Before Fluxer handles the event. Useful for MESSAGE_DELETE, where the
+// message still exists in the store.
+const offBefore = gateway.on('MESSAGE_CREATE', (data, meta) => {
+  console.log('incoming', meta.type, data);
+});
+
+// After Fluxer has applied the event.
+const offAfter = gateway.after('MESSAGE_UPDATE', (data, meta) => {
+  console.log('updated message', data.id);
+});
+
+// Wildcard listener: (type, data, meta).
+const offAny = gateway.onAny((type, data) => {
+  if (type === 'TYPING_START') console.log('typing', data.channel_id);
+});
+
+await gateway.ready; // resolves once Fluxer's gateway instance is patched
+
+// Clean up from your plugin's stop().
+offBefore();
+offAfter();
+offAny();
+```
+
+`meta` contains `{type, data, event, socket, at}`. `gateway.patched` reports
+whether dispatch is hooked, and `gateway.discover()` retries discovery manually.
+
+Stores are discovered from nested webpack exports (`exports.A`,
+`exports.default`, etc.). Common stores have short aliases:
+
+```js
+const {flux, stores} = window.__reflux;
+
+const messageStore = await flux.waitForStore('messages');
+const channelStore = flux.getStore('channels'); // alias: 'channelStore'
+const userStore = flux.getStore('userStore');
+const guildStore = flux.getStore('guildStore');
+
+// Custom discovery by shape.
+const myStore = flux.findStore((value) => typeof value?.getSomething === 'function');
+const waited = await flux.waitForStore((value) => typeof value?.getSomething === 'function');
+
+// Register a plugin-created store for other plugins.
+flux.registerStore('myPluginStore', myStore);
+
+// Subscribe when the store exposes subscribe/addChangeListener/observe.
+const off = flux.subscribe(myStore, () => console.log('store changed'));
+```
+
+`flux.messageStore`, `flux.channelStore`, `flux.userStore`, and
+`flux.guildStore` are convenience getters. Once React is ready, use
+`flux.useStore(store, selector)` in a component. `stores` is an alias for the
+same store helpers (`stores.messages`, `stores.find`, `stores.waitFor`,
+`stores.register`).
+
+---
+
+## Message events and extensions
+
+`window.__reflux.messages` provides normalized message events, cached lookup,
+and accessory/decoration extension points.
+
+```js
+const {messages} = window.__reflux;
+
+const offCreate = messages.on('create', (message, context) => {
+  console.log('new message', message.id, context.channelId);
+});
+
+messages.on('update', (message, context) => { /* … */ });
+messages.on('delete', (message, context) => { /* full object, before removal */ });
+messages.on('bulk-delete', (deletedMessages, context) => { /* … */ });
+
+// Raw gateway names work too.
+messages.on('MESSAGE_CREATE', (message) => { /* … */ });
+
+const message = messages.get(channelId, messageId);
+const recent = messages.getChannel(channelId);
+const currentChannelId = messages.currentChannelId();
+```
+
+Message event names are `create`, `update`, `delete`, and `bulk-delete`.
+Deletes are captured before Fluxer removes the message, so `message` is the
+full pre-delete object when the store was available.
+
+### Accessories and decorations
+
+Accessories render below a message; decorations render beside it. Both are
+mounted into Fluxer's `[data-message-id]` message rows and survive React
+re-renders.
+
+```js
+const React = await window.__reflux.react.ready;
+const {createElement: h} = React;
+
+const offDecoration = messages.registerDecoration({
+  name: 'myBadge',
+  position: 'before', // 'before' | 'after' | 'inside'
+  filter: (message) => Boolean(message?.content),
+  render: ({message, channelId}) => h('span', {
+    style: {fontSize: '11px', opacity: .7},
+  }, `#${channelId.slice(-4)}`),
+});
+
+const offAccessory = messages.registerAccessory({
+  name: 'myFooter',
+  render: ({message}) => h('div', {style: {fontSize: '12px'}}, `ID: ${message.id}`),
+});
+
+// Call from stop().
+offDecoration();
+offAccessory();
+```
+
+The `render` function receives
+`{message, channelId, messageId, row, context, api}`. It may return:
+
+- a React element (rendered through Reflux's `ErrorBoundary`);
+- a DOM `Node`;
+- a string/number;
+- `null` to render nothing;
+- a Promise resolving to any of the above;
+- a React component function, which is rendered with the same props.
+
+`filter(message, context)` (also accepted as `predicate` or `shouldRender`)
+controls whether the extension is mounted. `position` defaults to `before` for
+decorations and `after` for accessories. Optional `cleanup()` runs when the
+extension is removed.
+
+The same extensions can be declared directly on a plugin definition:
+
+```js
+module.exports = definePlugin({
+  name: 'myPlugin',
+  messageAccessories: {
+    footer: ({message}) => React.createElement('div', null, `ID: ${message.id}`),
+  },
+  messageDecorations: [
+    {name: 'badge', position: 'before', render: ({message}) => `#${message.id.slice(-4)}`},
+  ],
+  messageEvents: {
+    create: (message) => console.log('created', message.id),
+    delete: (message) => console.log('deleted', message.id),
+  },
+});
+```
+
+Handlers declared this way are registered and cleaned up automatically by
+`pluginManager.register()`. `onMessageCreate`, `onMessageUpdate`, and
+`onMessageDelete` are also supported as shorthand fields.
+
+---
+
+## Notices, modals and toasts
+
+```js
+const {notices, toasts, modals} = window.__reflux;
+
+const notice = notices.show({
+  type: 'info', // info | success | warning | danger
+  title: 'My Plugin',
+  message: 'Loaded successfully.',
+  dismissible: true,
+  timeout: 0,
+  actions: [
+    {label: 'Open settings', action: () => openMySettings()},
+  ],
+});
+notice.close();
+
+toasts.success('Saved!');
+toasts.error('Something failed.', {timeout: 5000});
+
+const modal = modals.open(
+  ({close}) => React.createElement('div', null,
+    React.createElement('h2', null, 'My modal'),
+    React.createElement('button', {onClick: close}, 'Close'),
+  ),
+  {modalType: 'my-plugin-modal', dismissible: true},
+);
+modal.close();
+modals.closeAll();
+```
+
+Notices are inserted into Fluxer's nagbar container when available, otherwise
+they use a fixed overlay. Toasts use Fluxer's native toast manager when
+discoverable and fall back to Reflux's own toast stack. Modals use Fluxer's
+native modal stack and fall back to a Reflux overlay. `notices.available` and
+`toasts.available` report native support; `modals.available` is true when either
+path is usable.
+
+`notices.show()` also accepts a React element, DOM node, string, or a render
+function receiving `{close, ...options}`. `toasts.show(content, options)` is the
+generic form; `toasts.info/success/warning/error` are shortcuts.
+
+---
+
+## Commands
+
+Register slash commands with `window.__reflux.commands`. Only registered
+commands are intercepted; Fluxer's built-in slash commands continue to work.
+
+```js
+const off = window.__reflux.commands.register({
+  name: 'echo',
+  description: 'Repeat text back.',
+  usage: '/echo <text>',
+  aliases: ['say'],
+  execute(args, context) {
+    // context: {command, name, args, raw, channelId, composer, api}
+    window.__reflux.toasts.info(args.join(' '));
+    return true; // false keeps the composer contents
+  },
+});
+
+// Call from stop().
+off();
+```
+
+Or declare commands on the plugin definition:
+
+```js
+module.exports = definePlugin({
+  name: 'myPlugin',
+  commands: {
+    ping: {
+      description: 'Check that the plugin is alive.',
+      execute() {
+        window.__reflux.toasts.success('pong');
+      },
+    },
+  },
+});
+```
+
+Commands run when the user presses Enter in the channel composer with a
+registered command. The composer is cleared after a command returns anything
+other than `false`. `commands.parse('/echo "hello world"')` returns
+`{name, args, raw, rest}`. Other helpers: `commands.get(name)`,
+`commands.list()`, `commands.run('/echo hello')`, `commands.unregister(name)`,
+and `commands.clearComposer(composer)`.
+
+A built-in `/reflux` command lists all registered plugin commands. Command
+output should use `notices`/`toasts` rather than sending chat messages, since
+Reflux does not expose Fluxer's private message-send pipeline.
+
+---
+
 ## Context menus
 
 `window.__reflux.contextMenu` is a small plugin-owned menu layer. Register a
@@ -618,9 +879,56 @@ are merged, so multiple plugins can contribute items for the same target.
 `contextMenu.open(items, {x, y, target, title})` can also open a menu manually,
 and `contextMenu.close()` / `contextMenu.isOpen()` are available.
 
+### Patching Fluxer's native context menus
+
+Use `contextMenu.patchNative()` to add plugin items to Fluxer's own action menu.
+Unlike `contextMenu.register()`, this leaves the native menu and all of its
+built-in items intact.
+
+```js
+const off = window.__reflux.contextMenu.patchNative((info) => {
+  // info: {method, event, target, point, config, module, api}
+  const messageRow = info.target?.closest?.('[data-message-id]');
+  if (!messageRow) return null;
+
+  return [
+    {
+      label: 'Copy message ID',
+      action: () => navigator.clipboard.writeText(messageRow.dataset.messageId),
+    },
+  ];
+});
+
+// Call from stop().
+off();
+```
+
+Providers are evaluated whenever a native menu opens and may return an item
+array or `{items}`. Items use the same `label`, `action`, `icon`, `danger`,
+`disabled`, and `hint` fields as the plugin-owned menu. Plugin items are
+rendered as a native Fluxer menu group.
+
+You can also open a native-styled menu directly:
+
+```js
+window.__reflux.contextMenu.openNative(
+  [
+    {label: 'Do something', action: () => console.log('clicked')},
+    {label: 'Remove', danger: true, action: () => cleanup()},
+  ],
+  {x: event.clientX, y: event.clientY, target: event.currentTarget},
+);
+```
+
+`contextMenu.native` exposes `openFromEvent`, `openAtPoint`, `openForElement`,
+`close`, and `available`. If Fluxer's menu module cannot be found, the
+`openNative()` helper falls back to Reflux's DOM menu.
+
 ---
 
 ## Intercepting the gateway WebSocket
+
+> **Prefer `window.__reflux.gateway` (see [Flux gateway events and store discovery](#flux-gateway-events-and-store-discovery)).** The manual `JSON.parse` hook below is only needed for lower-level inspection or if the gateway patch is unavailable.
 
 Fluxer decompresses its zstd-stream WebSocket frames and calls `JSON.parse()` on the result. Hook `JSON.parse` to intercept decoded gateway payloads without dealing with compression.
 

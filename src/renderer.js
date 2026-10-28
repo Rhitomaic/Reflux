@@ -893,6 +893,8 @@
   const _registeredStores = new Map();
   /** @type {Map<string, object>} */
   const _storeCache = new Map();
+  /** @type {Map<string, number>} */
+  const _storeMisses = new Map();
 
   function _resolveStoreName(name) {
     const key = String(name ?? '');
@@ -910,8 +912,15 @@
       }
       const matcher = STORE_MATCHERS[name];
       if (!matcher) return null;
+      const missedAt = _storeMisses.get(name);
+      if (missedAt && Date.now() - missedAt < 1000) return null;
       const found = _firstNestedExport((value) => matcher(value));
-      if (found?.value) _storeCache.set(name, found.value);
+      if (found?.value) {
+        _storeCache.set(name, found.value);
+        _storeMisses.delete(name);
+      } else {
+        _storeMisses.set(name, Date.now());
+      }
       return found?.value ?? null;
     }
 
@@ -931,6 +940,7 @@
     const key = _resolveStoreName(name);
     _registeredStores.set(key, store);
     _storeCache.set(key, store);
+    _storeMisses.delete(key);
     return () => {
       if (_registeredStores.get(key) === store) _registeredStores.delete(key);
       if (_storeCache.get(key) === store) _storeCache.delete(key);
@@ -1388,6 +1398,7 @@
     'Flex',
     'Text',
     'Menu',
+    'MenuItem',
     'Tooltip',
     'Modal',
     'Spinner',
@@ -3270,6 +3281,298 @@
   };
 
   // ---------------------------------------------------------------------------
+  // Commands
+  // ---------------------------------------------------------------------------
+
+  /** @type {Map<string, object>} */
+  const _commands = new Map();
+  /** @type {Map<string, string>} */
+  const _commandAliases = new Map();
+  let _commandInterceptorInstalled = false;
+
+  function _normalizeCommandName(name) {
+    return String(name ?? '').trim().replace(/^\/+/, '').toLowerCase();
+  }
+
+  function _splitCommandArgs(input) {
+    const args = [];
+    let current = '';
+    let quote = null;
+    let escaped = false;
+
+    for (const char of String(input ?? '')) {
+      if (escaped) {
+        current += char;
+        escaped = false;
+        continue;
+      }
+      if (char === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (quote) {
+        if (char === quote) quote = null;
+        else current += char;
+        continue;
+      }
+      if (char === '"' || char === "'") {
+        quote = char;
+        continue;
+      }
+      if (/\s/.test(char)) {
+        if (current) {
+          args.push(current);
+          current = '';
+        }
+        continue;
+      }
+      current += char;
+    }
+    if (current) args.push(current);
+    return args;
+  }
+
+  function parseCommand(input) {
+    const raw = String(input ?? '').trim();
+    if (!raw.startsWith('/')) return null;
+    const match = raw.match(/^\/([^\s]+)(?:\s+([\s\S]*))?$/);
+    if (!match) return null;
+    return {
+      raw,
+      name: _normalizeCommandName(match[1]),
+      args: _splitCommandArgs(match[2] ?? ''),
+      rest: match[2] ?? '',
+    };
+  }
+
+  function _resolveCommand(name) {
+    const key = _normalizeCommandName(name);
+    const canonical = _commandAliases.get(key) ?? key;
+    return _commands.get(canonical) ?? null;
+  }
+
+  function registerCommand(definition) {
+    const input = typeof definition === 'string'
+      ? {name: definition, execute: () => {}}
+      : (definition && typeof definition === 'object' ? {...definition} : null);
+    if (!input) throw new Error('registerCommand() requires a command definition.');
+    const name = _normalizeCommandName(input.name);
+    if (!name) throw new Error('Commands require a name.');
+    if (_commands.has(name)) throw new Error(`Command "/${name}" is already registered.`);
+
+    const execute = input.execute ?? input.run ?? input.handler;
+    if (typeof execute !== 'function') throw new Error(`Command "/${name}" requires execute().`);
+
+    const command = {
+      ...input,
+      name,
+      execute,
+      description: String(input.description ?? ''),
+      usage: input.usage ? String(input.usage) : `/${name}`,
+      aliases: Array.isArray(input.aliases) ? input.aliases.map(_normalizeCommandName).filter(Boolean) : [],
+    };
+
+    _commands.set(name, command);
+    for (const alias of command.aliases) {
+      if (_commands.has(alias) || _commandAliases.has(alias)) {
+        console.warn(`[Reflux:Commands] Alias "/${alias}" for "/${name}" is already in use.`);
+        continue;
+      }
+      _commandAliases.set(alias, name);
+    }
+
+    return () => unregisterCommand(name);
+  }
+
+  function unregisterCommand(name) {
+    const command = _resolveCommand(name);
+    if (!command) return false;
+    _commands.delete(command.name);
+    for (const [alias, target] of Array.from(_commandAliases)) {
+      if (target === command.name) _commandAliases.delete(alias);
+    }
+    return true;
+  }
+
+  function listCommands() {
+    return Array.from(_commands.values()).sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  async function runCommand(input, args, context = {}) {
+    const parsed = typeof input === 'string' && input.trim().startsWith('/')
+      ? parseCommand(input)
+      : {name: _normalizeCommandName(input), args: Array.isArray(args) ? args : [], raw: '', rest: ''};
+    if (!parsed) return false;
+
+    const command = _resolveCommand(parsed.name);
+    if (!command) return false;
+
+    const commandContext = {
+      ...context,
+      command,
+      name: command.name,
+      args: parsed.args,
+      raw: parsed.raw || `/${command.name}${parsed.args.length ? ` ${parsed.args.join(' ')}` : ''}`,
+      channelId: context.channelId ?? currentChannelId(),
+      api: __reflux,
+    };
+
+    try {
+      const result = await command.execute(parsed.args, commandContext);
+      return result === undefined ? true : result;
+    } catch (err) {
+      console.error(`[Reflux:Commands] "/${command.name}" failed:`, err);
+      toasts.error(`Command /${command.name} failed: ${err?.message ?? err}`);
+      return false;
+    }
+  }
+
+  function _composerText(composer) {
+    if (!composer) return '';
+    try {
+      const text = typeof composer.innerText === 'string' ? composer.innerText : composer.textContent;
+      return String(text ?? '').replace(/\u00a0/g, ' ').replace(/\r/g, '');
+    } catch {
+      return String(composer.textContent ?? '');
+    }
+  }
+
+  function _clearComposer(composer) {
+    if (!composer) return;
+    try { composer.focus({preventScroll: true}); } catch { /* ignore */ }
+    try {
+      const selection = window.getSelection?.();
+      const range = document.createRange?.();
+      if (selection && range) {
+        range.selectNodeContents(composer);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        if (!document.execCommand?.('delete')) {
+          range.deleteContents();
+        }
+      } else {
+        composer.textContent = '';
+      }
+      composer.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        inputType: 'deleteContentBackward',
+        data: null,
+      }));
+    } catch {
+      try { composer.textContent = ''; } catch { /* ignore */ }
+    }
+  }
+
+  function _onCommandKeyDown(event) {
+    if (event.defaultPrevented || event.isComposing || event.keyCode === 229) return;
+    if (event.key !== 'Enter' || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return;
+
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const composer = target.closest('[data-channel-textarea]');
+    if (!composer) return;
+
+    const text = _composerText(composer);
+    const parsed = parseCommand(text);
+    if (!parsed || !_resolveCommand(parsed.name)) return;
+
+    // Only registered Reflux commands are swallowed. Unknown slash commands
+    // keep Fluxer's built-in autocomplete and send behavior.
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+
+    const command = _resolveCommand(parsed.name);
+    runCommand(parsed.raw, parsed.args, {
+      event,
+      composer,
+      channelId: currentChannelId(),
+      text,
+    }).then((result) => {
+      if (result !== false && command.clearComposer !== false) _clearComposer(composer);
+    });
+  }
+
+  function ensureCommandInterceptor() {
+    if (_commandInterceptorInstalled) return;
+    _commandInterceptorInstalled = true;
+    document.addEventListener('keydown', _onCommandKeyDown, true);
+  }
+
+  function installPluginCommands(plugin) {
+    if (!plugin?.name || !plugin.commands) return () => {};
+    const definitions = Array.isArray(plugin.commands)
+      ? plugin.commands
+      : (typeof plugin.commands === 'object'
+        ? Object.entries(plugin.commands).map(([name, command]) =>
+          typeof command === 'function' ? {name, execute: command} : {name, ...command})
+        : []);
+    const cleanups = [];
+    for (const definition of definitions) {
+      try {
+        cleanups.push(registerCommand({...definition, plugin: plugin.name}));
+      } catch (err) {
+        console.error(`[Reflux:Commands] Could not register command for "${plugin.name}":`, err);
+      }
+    }
+    return () => {
+      for (const cleanup of cleanups.reverse()) {
+        try { cleanup(); } catch { /* already removed */ }
+      }
+    };
+  }
+
+  const commands = {
+    register: registerCommand,
+    add: registerCommand,
+    unregister: unregisterCommand,
+    remove: unregisterCommand,
+    get: _resolveCommand,
+    list: listCommands,
+    parse: parseCommand,
+    run: runCommand,
+    execute: runCommand,
+    clearComposer: _clearComposer,
+    get channelId() { return currentChannelId(); },
+  };
+
+  // A small built-in command so users can discover plugin commands without
+  // waiting for a plugin to register its own help command.
+  registerCommand({
+    name: 'reflux',
+    description: 'List installed Reflux plugin commands.',
+    usage: '/reflux',
+    plugin: 'reflux',
+    execute(_args, context) {
+      const list = listCommands().filter((command) => command.name !== 'reflux');
+      if (!list.length) {
+        toasts.info('No Reflux plugin commands are registered.');
+        return;
+      }
+      const content = document.createElement('div');
+      const header = document.createElement('div');
+      header.textContent = `${list.length} Reflux command${list.length === 1 ? '' : 's'}:`;
+      header.style.fontWeight = '600';
+      header.style.marginBottom = '.25rem';
+      content.appendChild(header);
+      for (const command of list) {
+        const row = document.createElement('div');
+        row.textContent = `${command.usage} — ${command.description || 'No description'}`;
+        content.appendChild(row);
+      }
+      notices.show({
+        type: 'info',
+        title: 'Reflux commands',
+        content,
+        timeout: 8000,
+      });
+      return true;
+    },
+  });
+
+  ensureCommandInterceptor();
+
+  // ---------------------------------------------------------------------------
   // Plugin registry (renderer-side)
   // ---------------------------------------------------------------------------
 
@@ -3300,6 +3603,8 @@
       try {
         const extensionCleanup = installPluginMessageExtensions(plugin);
         if (typeof extensionCleanup === 'function') cleanups.push(extensionCleanup);
+        const commandCleanup = installPluginCommands(plugin);
+        if (typeof commandCleanup === 'function') cleanups.push(commandCleanup);
 
         const result = plugin.start?.(patcher, __reflux);
         if (typeof result === 'function') cleanups.push(result);
@@ -3349,6 +3654,7 @@
     notices,
     modals,
     toasts,
+    commands,
     settings,
     definePlugin,
     OptionType,
