@@ -1556,6 +1556,637 @@
   };
 
   // ---------------------------------------------------------------------------
+  // Messages: events, cached lookup, accessories and decorations
+  // ---------------------------------------------------------------------------
+
+  const MESSAGE_CACHE_LIMIT = 5000;
+  const MESSAGE_EXTENSION_CSS = `
+    .reflux-message-decoration,
+    .reflux-message-accessory {
+      min-width: 0;
+      box-sizing: border-box;
+    }
+    .reflux-message-decoration {
+      display: flex;
+      align-items: center;
+      gap: .25rem;
+    }
+    .reflux-message-accessory {
+      margin-top: .25rem;
+    }
+    .reflux-message-decoration:empty,
+    .reflux-message-accessory:empty {
+      display: none;
+    }
+  `;
+
+  const MESSAGE_EVENT_ALIASES = {
+    create: 'MESSAGE_CREATE',
+    update: 'MESSAGE_UPDATE',
+    delete: 'MESSAGE_DELETE',
+    'bulk-delete': 'MESSAGE_DELETE_BULK',
+  };
+
+  /** @type {Map<string, {message: any, channelId: string, id: string, at: number, deleted: boolean}>} */
+  const _messageCache = new Map();
+  /** @type {Map<string, Set<Function>>} */
+  const _messageListeners = new Map();
+  /** @type {Map<string, object>} */
+  const _messageExtensions = new Map();
+  /** @type {Map<Element, Map<string, object>>} */
+  const _messageMounts = new Map();
+
+  let _messageExtensionSeq = 0;
+  let _messageScanScheduled = false;
+  let _messageObserver = null;
+
+  function _messageKey(channelId, id) {
+    return `${String(channelId ?? '')}\u0000${String(id ?? '')}`;
+  }
+
+  function _messageChannelId(message) {
+    const value = message?.channelId ?? message?.channel_id;
+    return value === undefined || value === null ? '' : String(value);
+  }
+
+  function _messageId(message) {
+    const value = message?.id ?? message?.messageId ?? message?.message_id;
+    return value === undefined || value === null ? '' : String(value);
+  }
+
+  function _rememberMessage(message, channelId, {deleted = false} = {}) {
+    if (!message || typeof message !== 'object') return null;
+    const id = _messageId(message);
+    const channel = String(channelId ?? _messageChannelId(message));
+    if (!id || !channel) return null;
+
+    const key = _messageKey(channel, id);
+    const previous = _messageCache.get(key);
+    _messageCache.delete(key);
+    _messageCache.set(key, {
+      message,
+      channelId: channel,
+      id,
+      at: Date.now(),
+      deleted: Boolean(deleted || previous?.deleted),
+    });
+
+    if (_messageCache.size > MESSAGE_CACHE_LIMIT) {
+      for (const oldKey of _messageCache.keys()) {
+        _messageCache.delete(oldKey);
+        if (_messageCache.size <= MESSAGE_CACHE_LIMIT) break;
+      }
+    }
+    return message;
+  }
+
+  function _cachedMessage(channelId, id) {
+    return _messageCache.get(_messageKey(channelId, id))?.message ?? null;
+  }
+
+  function getMessage(channelId, id) {
+    const channel = String(channelId ?? '');
+    const messageId = String(id ?? '');
+    if (!channel || !messageId) return null;
+
+    const store = findStore('messages');
+    if (store && typeof store.getMessage === 'function') {
+      try {
+        const message = store.getMessage(channel, messageId);
+        if (message) {
+          _rememberMessage(message, channel);
+          return message;
+        }
+      } catch { /* fall back to the gateway cache */ }
+    }
+    return _cachedMessage(channel, messageId);
+  }
+
+  function _asMessageArray(value) {
+    if (!value) return [];
+    if (Array.isArray(value)) return value;
+    if (Array.isArray(value.messages)) return value.messages;
+    if (value instanceof Map) return Array.from(value.values());
+    if (typeof value.toArray === 'function') {
+      try { return value.toArray(); } catch { /* ignore */ }
+    }
+    if (typeof value.values === 'function') {
+      try { return Array.from(value.values()); } catch { /* ignore */ }
+    }
+    if (typeof value[Symbol.iterator] === 'function') {
+      try { return Array.from(value); } catch { /* ignore */ }
+    }
+    return [];
+  }
+
+  function getChannelMessages(channelId) {
+    const channel = String(channelId ?? '');
+    if (!channel) return [];
+    const store = findStore('messages');
+    if (store && typeof store.getMessages === 'function') {
+      try {
+        const messages = _asMessageArray(store.getMessages(channel));
+        if (messages.length) {
+          for (const message of messages) _rememberMessage(message, channel);
+          return messages;
+        }
+      } catch { /* fall back to the cache */ }
+    }
+    return Array.from(_messageCache.values())
+      .filter((entry) => entry.channelId === channel && !entry.deleted)
+      .sort((a, b) => a.at - b.at)
+      .map((entry) => entry.message);
+  }
+
+  function currentChannelId() {
+    const match = window.location?.pathname?.match(/^\/channels\/(?:@me|@favorites|[^/]+)\/([^/]+)/);
+    return match?.[1] ? String(match[1]) : null;
+  }
+
+  function _messageContext(message, channelId, extra = {}) {
+    const id = _messageId(message) || String(extra.id ?? '');
+    const channel = String(channelId ?? _messageChannelId(message));
+    return {
+      message,
+      channelId: channel,
+      messageId: id,
+      id,
+      ...extra,
+    };
+  }
+
+  function _emitMessageEvent(event, message, context) {
+    const dispatch = (name, args) => {
+      const listeners = _messageListeners.get(name);
+      if (!listeners) return;
+      for (const listener of Array.from(listeners)) {
+        try { listener(...args); }
+        catch (err) { console.error(`[Reflux:Messages] "${name}" listener threw:`, err); }
+      }
+    };
+
+    dispatch(event, [message, context]);
+    dispatch(`message:${event}`, [message, context]);
+    const raw = MESSAGE_EVENT_ALIASES[event];
+    if (raw) dispatch(raw, [message, context]);
+    dispatch('*', [event, message, context]);
+  }
+
+  function onMessageEvent(event, listener) {
+    if (typeof listener !== 'function') return () => {};
+    const key = String(event || '*');
+    if (!_messageListeners.has(key)) _messageListeners.set(key, new Set());
+    _messageListeners.get(key).add(listener);
+    return () => _messageListeners.get(key)?.delete(listener);
+  }
+
+  function _cssEscape(value) {
+    if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') return CSS.escape(String(value));
+    return String(value).replace(/["\\]/g, '\\$&');
+  }
+
+  function _rowsForMessage(messageId) {
+    try { return Array.from(document.querySelectorAll(`[data-message-id="${_cssEscape(messageId)}"]`)); }
+    catch { return []; }
+  }
+
+  function _normalizeExtensionList(value) {
+    if (!value) return [];
+    if (typeof value === 'function') return [{name: 'default', render: value}];
+    if (Array.isArray(value)) {
+      return value.filter(Boolean).map((entry, index) => {
+        if (typeof entry === 'function') return {name: `item${index}`, render: entry};
+        return {...entry, name: entry.name ?? entry.id ?? `item${index}`};
+      });
+    }
+    if (typeof value === 'object') {
+      return Object.entries(value).filter(([, entry]) => Boolean(entry)).map(([name, entry]) => {
+        if (typeof entry === 'function') return {name, render: entry};
+        return {...entry, name: entry.name ?? name};
+      });
+    }
+    return [];
+  }
+
+  function registerMessageExtension(kind, definition, options = {}) {
+    if (kind !== 'accessory' && kind !== 'decoration') {
+      throw new Error('Message extensions must be an accessory or a decoration.');
+    }
+    const input = typeof definition === 'function'
+      ? {...options, render: definition}
+      : {...options, ...definition};
+    if (typeof input.render !== 'function' && typeof input.component === 'function') {
+      input.render = input.component;
+    }
+    if (typeof input.render !== 'function') {
+      throw new Error(`${kind} registration requires a render() function.`);
+    }
+
+    const name = String(input.name ?? input.id ?? `${kind}-${++_messageExtensionSeq}`);
+    const key = `${kind}:${name}:${++_messageExtensionSeq}`;
+    const extension = {
+      ...input,
+      key,
+      kind,
+      name,
+      position: input.position ?? (kind === 'decoration' ? 'before' : 'after'),
+      order: Number.isFinite(input.order) ? input.order : 0,
+    };
+    _messageExtensions.set(key, extension);
+    scheduleMessageScan();
+
+    return () => {
+      _messageExtensions.delete(key);
+      for (const [row, mounts] of Array.from(_messageMounts)) {
+        const mount = mounts.get(key);
+        if (!mount) continue;
+        _unmountMessageExtension(mount);
+        mounts.delete(key);
+        if (!mounts.size) _messageMounts.delete(row);
+      }
+      scheduleMessageScan();
+    };
+  }
+
+  function _extensionApplies(extension, message, context) {
+    if (extension.enabled === false) return false;
+    const predicate = extension.filter ?? extension.predicate ?? extension.shouldRender;
+    if (typeof predicate !== 'function') return true;
+    try { return Boolean(predicate(message, context)); }
+    catch (err) {
+      console.error(`[Reflux:Messages] Filter for "${extension.name}" threw:`, err);
+      return false;
+    }
+  }
+
+  function _extensionTarget(row, extension) {
+    const content = row.querySelector(
+      '[data-flx^="channel.user-message.message-content"], ' +
+      '[data-flx^="channel.system-message.system-message-content"], ' +
+      '[data-flx^="channel.unknown-message.message-content"]',
+    ) ?? row;
+    const position = extension.position;
+    if (position === 'inside' || position === 'content') return {parent: content, before: false};
+    if (position === 'before') return {parent: row, before: true};
+    return {parent: row, before: false};
+  }
+
+  function _placeExtension(container, target) {
+    if (!target?.parent) return;
+    if (target.before) {
+      if (target.parent.firstChild !== container) target.parent.insertBefore(container, target.parent.firstChild);
+    } else if (container.parentNode !== target.parent) {
+      target.parent.appendChild(container);
+    }
+  }
+
+  function _renderExtensionOutput(output, extension, context, container) {
+    if (!container?.isConnected) return;
+    const React = _react;
+
+    const looksLikeReactElement = output && typeof output === 'object' &&
+      (output.$$typeof !== undefined || output._owner !== undefined);
+    if (!React && (looksLikeReactElement || typeof output === 'function')) {
+      reactApi.ready.then(() => scheduleMessageScan());
+      return;
+    }
+
+    if (React && React.isValidElement(output)) {
+      const element = React.createElement(
+        components.ErrorBoundary,
+        {
+          name: `Message ${extension.kind}: ${extension.name}`,
+          fallback: null,
+          onError: (error) => console.error(
+            `[Reflux:Messages] ${extension.kind} "${extension.name}" failed:`,
+            error,
+          ),
+        },
+        output,
+      );
+      reactApi.render(element, container);
+      return;
+    }
+
+    if (React && Array.isArray(output) && output.every((item) => React.isValidElement(item))) {
+      _renderExtensionOutput(React.createElement(React.Fragment, null, ...output), extension, context, container);
+      return;
+    }
+
+    if (React && typeof output === 'function') {
+      _renderExtensionOutput(
+        React.createElement(output, {
+          message: context.message,
+          channelId: context.channelId,
+          messageId: context.messageId,
+          context,
+        }),
+        extension,
+        context,
+        container,
+      );
+      return;
+    }
+
+    reactApi.unmount(container);
+    if (output === undefined || output === null) {
+      container.textContent = '';
+      return;
+    }
+    if (typeof Node !== 'undefined' && output instanceof Node) {
+      container.replaceChildren(output);
+      return;
+    }
+    container.textContent = String(output);
+  }
+
+  function _renderMessageExtension(extension, context, container) {
+    let output;
+    try {
+      output = extension.render({
+        message: context.message,
+        channelId: context.channelId,
+        messageId: context.messageId,
+        id: context.messageId,
+        row: context.row,
+        context,
+        api: __reflux,
+      });
+    } catch (err) {
+      console.error(`[Reflux:Messages] ${extension.kind} "${extension.name}" render threw:`, err);
+      return;
+    }
+
+    if (output && typeof output.then === 'function') {
+      output.then((value) => _renderExtensionOutput(value, extension, context, container))
+        .catch((err) => console.error(`[Reflux:Messages] ${extension.kind} "${extension.name}" failed:`, err));
+      return;
+    }
+    _renderExtensionOutput(output, extension, context, container);
+  }
+
+  function _unmountMessageExtension(mount) {
+    if (!mount) return;
+    try { mount.extension.cleanup?.(); }
+    catch (err) { console.error(`[Reflux:Messages] Cleanup for "${mount.extension.name}" threw:`, err); }
+    if (mount.container) {
+      try { reactApi.unmount(mount.container); } catch { /* not a React root */ }
+      mount.container.remove();
+    }
+  }
+
+  function _unmountMessageRow(row) {
+    const mounts = _messageMounts.get(row);
+    if (!mounts) return;
+    for (const mount of mounts.values()) _unmountMessageExtension(mount);
+    _messageMounts.delete(row);
+  }
+
+  function _refreshMessageRow(row, message) {
+    const mounts = _messageMounts.get(row);
+    if (!mounts?.size) return;
+    const channelId = _messageChannelId(message) || currentChannelId() || '';
+    const context = _messageContext(message, channelId, {row});
+    for (const mount of mounts.values()) {
+      const target = _extensionTarget(row, mount.extension);
+      _placeExtension(mount.container, target);
+      mount.context = context;
+      _renderMessageExtension(mount.extension, context, mount.container);
+    }
+  }
+
+  function _refreshMessage(message) {
+    const id = _messageId(message);
+    if (!id) return;
+    for (const row of _rowsForMessage(id)) _refreshMessageRow(row, message);
+    scheduleMessageScan();
+  }
+
+  function _applyMessageExtensions(row, messageId) {
+    const message = getMessage(currentChannelId(), messageId) ?? _cachedMessage(currentChannelId(), messageId);
+    const channelId = _messageChannelId(message) || currentChannelId() || '';
+    const context = _messageContext(message ?? {id: messageId, channelId}, channelId, {row});
+    let mounts = _messageMounts.get(row);
+
+    for (const extension of _messageExtensions.values()) {
+      const mount = mounts?.get(extension.key);
+      if (!_extensionApplies(extension, message, context)) {
+        if (mount) {
+          _unmountMessageExtension(mount);
+          mounts.delete(extension.key);
+        }
+        continue;
+      }
+
+      if (mount && mount.container?.isConnected) {
+        mount.context = context;
+        _placeExtension(mount.container, _extensionTarget(row, extension));
+        continue;
+      }
+
+      if (mount) {
+        _unmountMessageExtension(mount);
+        mounts.delete(extension.key);
+      }
+
+      const container = document.createElement('div');
+      container.className = `reflux-message-${extension.kind}`;
+      container.dataset.refluxMessageExtension = extension.kind;
+      container.dataset.refluxExtensionName = extension.name;
+      container.dataset.refluxMessageId = messageId;
+      _placeExtension(container, _extensionTarget(row, extension));
+
+      if (!mounts) {
+        mounts = new Map();
+        _messageMounts.set(row, mounts);
+      }
+      const nextMount = {extension, container, context};
+      mounts.set(extension.key, nextMount);
+      _renderMessageExtension(extension, context, container);
+    }
+
+    if (mounts && !mounts.size) _messageMounts.delete(row);
+  }
+
+  function _scanMessageRows() {
+    if (!_messageExtensions.size) {
+      for (const row of Array.from(_messageMounts.keys())) _unmountMessageRow(row);
+      return;
+    }
+
+    const rows = Array.from(document.querySelectorAll('[data-message-id]'));
+    const liveRows = new Set(rows);
+    for (const [row, mounts] of Array.from(_messageMounts)) {
+      if (!liveRows.has(row) || !row.isConnected) {
+        _unmountMessageRow(row);
+        continue;
+      }
+      for (const mount of Array.from(mounts.values())) {
+        if (!mount.container?.isConnected) {
+          _unmountMessageExtension(mount);
+          mounts.delete(mount.extension.key);
+        }
+      }
+      if (!mounts.size) _messageMounts.delete(row);
+    }
+
+    for (const row of rows) {
+      const messageId = row.getAttribute('data-message-id');
+      if (messageId) _applyMessageExtensions(row, messageId);
+    }
+  }
+
+  function scheduleMessageScan() {
+    if (_messageScanScheduled) return;
+    _messageScanScheduled = true;
+    const run = () => {
+      _messageScanScheduled = false;
+      try { _scanMessageRows(); }
+      catch (err) { console.error('[Reflux:Messages] Extension scan failed:', err); }
+    };
+    if (typeof window.requestAnimationFrame === 'function') window.requestAnimationFrame(run);
+    else setTimeout(run, 16);
+  }
+
+  function ensureMessageObserver() {
+    if (_messageObserver) return;
+    ui.injectCSS('message-extensions', MESSAGE_EXTENSION_CSS);
+    _messageObserver = new MutationObserver(() => scheduleMessageScan());
+    _messageObserver.observe(document.documentElement, {childList: true, subtree: true});
+    scheduleMessageScan();
+  }
+
+  function installPluginMessageExtensions(plugin) {
+    if (!plugin?.name) return () => {};
+    const cleanups = [];
+
+    for (const [kind, list] of [
+      ['accessory', plugin.messageAccessories],
+      ['decoration', plugin.messageDecorations],
+    ]) {
+      for (const entry of _normalizeExtensionList(list)) {
+        try {
+          cleanups.push(registerMessageExtension(
+            kind,
+            {...entry, order: entry.order ?? 0},
+            {plugin: plugin.name},
+          ));
+        } catch (err) {
+          console.error(`[Reflux] Could not install ${kind} "${entry.name}" for "${plugin.name}":`, err);
+        }
+      }
+    }
+
+    const eventHandlers = plugin.messageEvents ?? {};
+    for (const [event, handler] of Object.entries(eventHandlers)) {
+      if (typeof handler === 'function') cleanups.push(onMessageEvent(event, handler));
+    }
+    for (const [event, handler] of [
+      ['create', plugin.onMessageCreate],
+      ['update', plugin.onMessageUpdate],
+      ['delete', plugin.onMessageDelete],
+    ]) {
+      if (typeof handler === 'function') cleanups.push(onMessageEvent(event, handler));
+    }
+
+    return () => {
+      for (const cleanup of cleanups.reverse()) {
+        try { cleanup(); } catch { /* already removed */ }
+      }
+    };
+  }
+
+  const messages = {
+    on: onMessageEvent,
+    get: getMessage,
+    getChannel: getChannelMessages,
+    currentChannelId,
+    refresh: scheduleMessageScan,
+
+    registerAccessory(definition, options) {
+      const cleanup = registerMessageExtension('accessory', definition, options);
+      ensureMessageObserver();
+      return cleanup;
+    },
+    registerDecoration(definition, options) {
+      const cleanup = registerMessageExtension('decoration', definition, options);
+      ensureMessageObserver();
+      return cleanup;
+    },
+    addAccessory(definition, options) { return messages.registerAccessory(definition, options); },
+    addDecoration(definition, options) { return messages.registerDecoration(definition, options); },
+
+    get store() { return findStore('messages'); },
+    get channelId() { return currentChannelId(); },
+  };
+
+  // Cache and broadcast message lifecycle events. Deletes are handled before
+  // Fluxer removes the message, so plugins still receive the full object.
+  gateway.on('MESSAGE_CREATE', (data) => {
+    _rememberMessage(data, _messageChannelId(data));
+  });
+  gateway.after('MESSAGE_CREATE', (data, meta) => {
+    const channelId = _messageChannelId(data) || currentChannelId() || '';
+    const message = getMessage(channelId, _messageId(data)) ?? data;
+    _rememberMessage(message, channelId);
+    const context = _messageContext(message, channelId, {phase: meta.phase, gateway: meta});
+    _emitMessageEvent('create', message, context);
+    _refreshMessage(message);
+  });
+
+  gateway.on('MESSAGE_UPDATE', (data) => {
+    const channelId = _messageChannelId(data) || _messageChannelId(data?.message) || currentChannelId() || '';
+    const id = _messageId(data) || _messageId(data?.message);
+    const message = getMessage(channelId, id) ?? data?.message ?? data;
+    _rememberMessage(message, channelId);
+  });
+  gateway.after('MESSAGE_UPDATE', (data, meta) => {
+    const channelId = _messageChannelId(data) || _messageChannelId(data?.message) || currentChannelId() || '';
+    const id = _messageId(data) || _messageId(data?.message);
+    const message = getMessage(channelId, id) ?? data?.message ?? data;
+    _rememberMessage(message, channelId);
+    const context = _messageContext(message, channelId, {phase: meta.phase, gateway: meta});
+    _emitMessageEvent('update', message, context);
+    _refreshMessage(message);
+  });
+
+  gateway.on('MESSAGE_DELETE', (data, meta) => {
+    const channelId = _messageChannelId(data) || currentChannelId() || '';
+    const id = _messageId(data);
+    if (!id) return;
+    const message = getMessage(channelId, id) ?? _cachedMessage(channelId, id) ?? data;
+    _rememberMessage(message, channelId, {deleted: true});
+    const context = _messageContext(message, channelId, {phase: meta.phase, gateway: meta});
+    _emitMessageEvent('delete', message, context);
+    for (const row of _rowsForMessage(id)) _unmountMessageRow(row);
+  });
+
+  function _handleBulkDelete(data, meta) {
+    const channelId = _messageChannelId(data) || currentChannelId() || '';
+    const ids = Array.isArray(data?.ids) ? data.ids.map(String) : [];
+    const deleted = [];
+    for (const id of ids) {
+      const message = getMessage(channelId, id) ?? _cachedMessage(channelId, id) ?? {id, channelId, channel_id: channelId};
+      _rememberMessage(message, channelId, {deleted: true});
+      deleted.push(message);
+      for (const row of _rowsForMessage(id)) _unmountMessageRow(row);
+    }
+    const context = _messageContext({id: '', channelId}, channelId, {
+      ids,
+      messages: deleted,
+      phase: meta.phase,
+      gateway: meta,
+    });
+    _emitMessageEvent('bulk-delete', deleted, context);
+    for (const message of deleted) _emitMessageEvent('delete', message, {...context, message});
+  }
+
+  gateway.on('MESSAGE_DELETE_BULK', _handleBulkDelete);
+  gateway.on('MESSAGE_BULK_DELETE', _handleBulkDelete);
+
+  ensureMessageObserver();
+
+  // ---------------------------------------------------------------------------
   // Context menu API
   // ---------------------------------------------------------------------------
 
@@ -1899,14 +2530,27 @@
         catch (err) { console.error(`[Reflux] Could not create settings store for "${plugin.name}":`, err); }
       }
       let cleanup = null;
+      const cleanups = [];
       try {
+        const extensionCleanup = installPluginMessageExtensions(plugin);
+        if (typeof extensionCleanup === 'function') cleanups.push(extensionCleanup);
+
         const result = plugin.start?.(patcher, __reflux);
-        cleanup = typeof result === 'function'
-          ? result
-          : (typeof plugin.stop === 'function' ? () => plugin.stop() : null);
+        if (typeof result === 'function') cleanups.push(result);
+        else if (typeof plugin.stop === 'function') cleanups.push(() => plugin.stop());
+
+        cleanup = () => {
+          for (const fn of cleanups.reverse()) {
+            try { fn(); }
+            catch (err) { console.error(`[Reflux] "${plugin.name}" cleanup threw:`, err); }
+          }
+        };
         _plugins.set(plugin.name, { plugin, cleanup });
         console.log(`[Reflux] Plugin "${plugin.name}" started.`);
       } catch (err) {
+        for (const fn of cleanups.reverse()) {
+          try { fn(); } catch { /* best effort */ }
+        }
         console.error(`[Reflux] Plugin "${plugin.name}" failed to start:`, err);
       }
     },
@@ -1935,6 +2579,7 @@
     flux,
     gateway,
     stores,
+    messages,
     settings,
     definePlugin,
     OptionType,
