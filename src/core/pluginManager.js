@@ -29,6 +29,8 @@
 const fs      = require('node:fs');
 const path    = require('node:path');
 const settings = require('./settings');
+const pluginSchema = require('./pluginSchema');
+const pluginSettings = require('./pluginSettings');
 
 // ---------------------------------------------------------------------------
 // State
@@ -50,7 +52,9 @@ const IPC_CH = {
 // ---------------------------------------------------------------------------
 
 function _isEnabled(name) {
-  return settings.get(`plugins.${name}.enabled`, true);
+  const module = _registry.get(name)?.module;
+  if (module?.required) return true;
+  return settings.get(`plugins.${name}.enabled`, module?.enabledByDefault ?? true);
 }
 
 /**
@@ -65,6 +69,9 @@ function _loadPlugin(pluginDir) {
   try { plugin = require(indexPath); }
   catch (err) { console.error(`[Reflux:PluginManager] require("${indexPath}") failed:`, err); return null; }
 
+  try { plugin = pluginSchema.normalizePlugin(plugin); }
+  catch (err) { console.error(`[Reflux:PluginManager] Invalid plugin at "${pluginDir}":`, err); return null; }
+
   if (typeof plugin.name !== 'string' || !plugin.name) {
     console.error(`[Reflux:PluginManager] Plugin at "${pluginDir}" missing valid "name".`);
     return null;
@@ -72,6 +79,10 @@ function _loadPlugin(pluginDir) {
   if (typeof plugin.start !== 'function' || typeof plugin.stop !== 'function') {
     console.error(`[Reflux:PluginManager] "${plugin.name}" must export start() and stop().`);
     return null;
+  }
+
+  if (plugin.settings.length && !plugin.settingsStore) {
+    plugin.settingsStore = pluginSettings.createStore(plugin.name, plugin.settings);
   }
   return plugin;
 }
@@ -152,13 +163,20 @@ function disablePlugin(name) {
 function list() {
   return Array.from(_registry.entries()).map(([name, entry]) => ({
     name,
-    displayName:  entry.module.displayName  || name,
-    description:  entry.module.description || '',
-    icon:         entry.module.icon         || null,
-    rendererSrc:  entry.module.rendererSrc  || null,
-    settings:     Array.isArray(entry.module.settings) ? entry.module.settings : [],
-    started:      entry.started,
-    enabled:      _isEnabled(name),
+    displayName:      entry.module.displayName || name,
+    description:      entry.module.description || '',
+    icon:             entry.module.icon || null,
+    rendererSrc:      entry.module.rendererSrc || null,
+    settings:         Array.isArray(entry.module.settings) ? entry.module.settings : [],
+    authors:          entry.module.authors || [],
+    tags:             entry.module.tags || [],
+    dependencies:     entry.module.dependencies || [],
+    required:         Boolean(entry.module.required),
+    hidden:           Boolean(entry.module.hidden),
+    enabledByDefault: entry.module.enabledByDefault !== false,
+    requiresRestart:  Boolean(entry.module.requiresRestart),
+    started:          entry.started,
+    enabled:          _isEnabled(name),
   }));
 }
 

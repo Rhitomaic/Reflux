@@ -20,17 +20,30 @@ Create a folder under `src/plugins/<your-plugin-name>/` and add `index.js`:
 ```js
 'use strict';
 
-module.exports = {
+const {definePlugin, OptionType} = require('../../core/pluginApi');
+
+module.exports = definePlugin({
   name:        'myPlugin',       // unique ID — used as the settings key
   displayName: 'My Plugin',      // shown in the Reflux settings UI
   description: 'One-line description shown in the plugin list.',
   rendererSrc: null,             // path to renderer script, or null
+  settings: {
+    enabledThing: {
+      label: 'Enable thing',
+      description: 'Turns the thing on.',
+      type: OptionType.BOOLEAN,
+      default: true,
+    },
+  },
   start() {},
   stop()  {},
-};
+});
 ```
 
 That's it. Reflux discovers and loads it automatically on the next Fluxer launch.
+
+`definePlugin()` is optional — plain objects are normalized too — but it gives you
+`OptionType`, consistent metadata defaults, and a scoped `plugin.settingsStore`.
 
 ---
 
@@ -42,37 +55,108 @@ That's it. Reflux discovers and loads it automatically on the next Fluxer launch
 | `displayName` | `string` | | Human-readable name shown in the UI. Defaults to `name`. |
 | `description` | `string` | | Short description shown in the plugin card. |
 | `rendererSrc` | `string \| null` | | Absolute path to a renderer-side script injected into the Fluxer web context. |
-| `settings` | `array` | | Optional settings schema rendered below the plugin card. See [Plugin settings](#plugin-settings). |
+| `settings` | `object \| array` | | Optional settings schema. Object form is preferred; legacy arrays are normalized. See [Plugin settings](#plugin-settings). |
+| `settingsStore` | `object` | | Scoped settings store attached by Reflux before `start()`. Read/write and subscribe to settings here. |
+| `authors` | `array` | | Optional author metadata. |
+| `tags` | `string[]` | | Optional categories shown in the plugin UI. |
+| `dependencies` | `string[]` | | Names of plugins that must be enabled first. |
+| `enabledByDefault` | `boolean` | | Defaults to `true` for backwards compatibility. |
+| `required` / `hidden` | `boolean` | | Mark core or hidden plugins. |
+| `requiresRestart` | `boolean` | | Hint that toggling the plugin needs a Fluxer restart. |
 | `start()` | `function` | ✅ | Called when the plugin is enabled. |
 | `stop()` | `function` | ✅ | Called when the plugin is disabled or Reflux unloads. |
 
 ### Plugin settings
 
-`settings` is an array of option descriptors. Reflux renders supported option
-types below the plugin's toggle in **Reflux → Plugins** and saves values at
-`plugins.<plugin-name>.<setting-key>`.
+`settings` can be an object keyed by setting name (preferred) or the legacy
+array form. Keys are saved at `plugins.<plugin-name>.<setting-key>`.
 
 ```js
-module.exports = {
+const {definePlugin, OptionType} = require('../../core/pluginApi');
+
+module.exports = definePlugin({
   name: 'myPlugin',
   displayName: 'My Plugin',
   description: 'Does stuff.',
-  settings: [
-    {
-      key: 'showBadge',
+  settings: {
+    showBadge: {
       label: 'Show badge',
       description: 'Display a small badge next to message authors.',
-      type: 'boolean',
+      type: OptionType.BOOLEAN,
       default: true,
     },
-  ],
-};
+  },
+});
 ```
 
-Currently supported types are `boolean` and `hidden`. Renderer plugins can
-subscribe to changes through `window.__reflux.events.on('setting-changed', ...)`
-or by listening for the `reflux:setting-changed` DOM event. Both receive
-`(key, value)` / `event.detail = {key, value}`.
+The settings schema is normalized by `definePlugin()`. Supported option types
+in the core API are `OptionType.STRING`, `NUMBER`, `BOOLEAN`, `SELECT`,
+`SLIDER`, `COMPONENT`, and `CUSTOM`.
+
+`definePlugin()` attaches a main-process settings store before `start()`:
+
+```js
+module.exports = definePlugin({
+  name: 'myPlugin',
+  settings: {
+    threshold: {type: OptionType.NUMBER, default: 10, description: '…'},
+  },
+  start() {
+    const threshold = this.settingsStore.get('threshold');
+    this.settingsStore.set('threshold', 20);
+
+    // React to changes made by the settings UI.
+    this.settingsStore.subscribe((key, value) => {
+      console.log('setting changed:', key, value);
+    });
+
+    // Dot access is also proxied:
+    console.log(this.settingsStore.store.threshold);
+  },
+  stop() {},
+});
+```
+
+Renderer-side plugins can use the same shape through `window.__reflux`:
+
+```js
+const plugin = window.__reflux.definePlugin({
+  name: 'myRendererPlugin',
+  settings: {
+    enabledThing: {
+      type: window.__reflux.OptionType.BOOLEAN,
+      description: '…',
+      default: true,
+    },
+  },
+});
+
+await plugin.settingsStore.ready;
+console.log(plugin.settingsStore.store.enabledThing);
+```
+
+Renderer plugins can also register settings without `definePlugin()`:
+
+```js
+const store = window.__reflux.settings.createStore('myRendererPlugin', {
+  enabledThing: {
+    type: window.__reflux.OptionType.BOOLEAN,
+    description: '…',
+    default: true,
+  },
+});
+```
+
+`settingsStore.plain` is a plain object, `settingsStore.store` is a reactive
+proxy, `settingsStore.subscribe(listener)` returns an unsubscribe function, and
+`settingsStore.use(paths)` is available once the React runtime is loaded.
+Setting changes emit both `window.__reflux.events.on('setting-changed', ...)`
+and the DOM event `reflux:setting-changed`.
+
+> **Renderer-side functions:** settings functions such as `onChange`,
+> `hidden`, `disabled`, `component`, and `render` must be declared in the
+> renderer-side schema. Main-process schemas are serialized over IPC, so only
+> their plain data (labels, types, defaults, options) reaches the settings UI.
 
 ---
 

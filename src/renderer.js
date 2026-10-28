@@ -33,6 +33,34 @@
   // Guard against double injection.
   if (window.__reflux) return;
 
+  // Shared plugin schema, injected immediately before this script by
+  // src/main-inject.mjs. The fallback keeps the renderer bootable if someone
+  // injects renderer.js on its own.
+  const pluginSchema = window.__refluxPluginSchema;
+  const OptionType = pluginSchema?.OptionType ?? Object.freeze({
+    STRING:    'string',
+    NUMBER:    'number',
+    BOOLEAN:   'boolean',
+    SELECT:    'select',
+    SLIDER:    'slider',
+    COMPONENT: 'component',
+    CUSTOM:    'custom',
+  });
+  const normalizeSettings = pluginSchema?.normalizeSettings ?? ((settings) => Array.isArray(settings)
+    ? settings
+    : Object.entries(settings ?? {}).map(([key, setting]) => ({key, label: key, type: 'string', ...setting})));
+  const settingsToDef = pluginSchema?.settingsToDef ?? ((settings) => Object.fromEntries(
+    normalizeSettings(settings).map((setting) => [setting.key, setting]),
+  ));
+  const coerceSettingValue = pluginSchema?.coerceSettingValue ?? ((_setting, value) => value);
+  const normalizePluginDefinition = pluginSchema?.normalizePlugin ?? ((plugin) => plugin);
+  const mergeSettings = pluginSchema?.mergeSettings ?? ((base, override) =>
+    [...normalizeSettings(base), ...normalizeSettings(override)]);
+
+  if (!pluginSchema) {
+    console.error('[Reflux] pluginSchema.js was not injected before renderer.js; using fallback schema helpers.');
+  }
+
   // ---------------------------------------------------------------------------
   // Mini event emitter
   // ---------------------------------------------------------------------------
@@ -52,6 +80,223 @@
       });
     },
   };
+
+  // ---------------------------------------------------------------------------
+  // Plugin settings API
+  // ---------------------------------------------------------------------------
+
+  /** @type {Map<string, Array<object>>} */
+  const _settingsSchemas = new Map();
+  /** @type {Map<string, object>} */
+  const _settingsStores = new Map();
+  /** Populated by the React kit once it is available. */
+  let _reactRuntime = null;
+
+  function fullSettingKey(pluginName, key) {
+    return `plugins.${pluginName}.${key}`;
+  }
+
+  function emitSettingChanged(pluginName, key, value) {
+    const fullKey = fullSettingKey(pluginName, key);
+    events.emit('setting-changed', fullKey, value);
+    try {
+      window.dispatchEvent(new CustomEvent('reflux:setting-changed', {detail: {key: fullKey, value}}));
+    } catch { /* CustomEvent is not essential */ }
+  }
+
+  function registerSettingsSchema(pluginName, settingsSchema) {
+    if (!pluginName) return [];
+    const previous = _settingsSchemas.get(pluginName) ?? [];
+    const next = settingsSchema === undefined
+      ? previous
+      : mergeSettings(previous, settingsSchema);
+    _settingsSchemas.set(pluginName, next);
+    return next;
+  }
+
+  /**
+   * Create (or reuse) a reactive per-plugin settings store.
+   *
+   * @param {string} pluginName
+   * @param {Array<object>|Record<string, object>} [settingsSchema]
+   * @returns {object}
+   */
+  function createSettingsStore(pluginName, settingsSchema) {
+    if (!pluginName) throw new Error('createSettingsStore() requires a plugin name.');
+
+    const existing = _settingsStores.get(pluginName);
+    if (existing) {
+      if (settingsSchema !== undefined) existing.updateSchema(settingsSchema);
+      return existing;
+    }
+
+    const definitions = registerSettingsSchema(pluginName, settingsSchema);
+    const def = settingsToDef(definitions);
+    const plain = {};
+    for (const setting of Object.values(def)) {
+      plain[setting.key] = coerceSettingValue(setting, setting.default);
+    }
+
+    const listeners = new Set();
+
+    function notify(key, value) {
+      for (const listener of listeners) {
+        try { listener(key, value, plain); }
+        catch (err) { console.error(`[Reflux:Settings] "${pluginName}" listener threw:`, err); }
+      }
+    }
+
+    function runOnChange(key, value) {
+      const setting = def[key];
+      if (typeof setting?.onChange !== 'function') return;
+      try { setting.onChange.call(store, value); }
+      catch (err) { console.error(`[Reflux:Settings] "${pluginName}.${key}" onChange threw:`, err); }
+    }
+
+    async function setValue(key, value) {
+      if (!(key in def)) throw new Error(`Unknown setting "${pluginName}.${key}".`);
+      const next = coerceSettingValue(def[key], value);
+      const previous = plain[key];
+
+      plain[key] = next;
+      notify(key, next);
+      emitSettingChanged(pluginName, key, next);
+      runOnChange(key, next);
+
+      const bridge = window.refluxBridge;
+      if (bridge?.setSetting) {
+        try { await bridge.setSetting(fullSettingKey(pluginName, key), next); }
+        catch (err) {
+          plain[key] = previous;
+          notify(key, previous);
+          emitSettingChanged(pluginName, key, previous);
+          throw err;
+        }
+      }
+      return next;
+    }
+
+    const store = new Proxy(plain, {
+      get(target, property, receiver) {
+        if (property === 'plain') return plain;
+        if (property === 'def') return def;
+        if (property === 'store') return store;
+        if (property === 'toJSON') return () => ({...plain});
+        return Reflect.get(target, property, receiver);
+      },
+      set(target, property, value) {
+        if (typeof property === 'string' && property in def) {
+          setValue(property, value).catch(err =>
+            console.error(`[Reflux:Settings] "${pluginName}.${property}" save failed:`, err));
+          return true;
+        }
+        target[property] = value;
+        return true;
+      },
+      has(target, property) {
+        return property in target || property in def ||
+          property === 'plain' || property === 'def' || property === 'store';
+      },
+    });
+
+    function updateSchema(nextSchema) {
+      if (nextSchema === undefined) return api;
+      const merged = registerSettingsSchema(pluginName, nextSchema);
+      const nextDef = settingsToDef(merged);
+      Object.assign(def, nextDef);
+      for (const [key, setting] of Object.entries(nextDef)) {
+        if (!(key in plain)) plain[key] = coerceSettingValue(setting, setting.default);
+      }
+      return api;
+    }
+
+    const ready = (async () => {
+      try {
+        const all = await window.refluxBridge?.getAllSettings?.() ?? {};
+        const values = all?.plugins?.[pluginName];
+        if (values && typeof values === 'object') {
+          for (const setting of Object.values(def)) {
+            if (Object.prototype.hasOwnProperty.call(values, setting.key)) {
+              plain[setting.key] = coerceSettingValue(setting, values[setting.key]);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn(`[Reflux:Settings] Could not hydrate "${pluginName}" settings:`, err);
+      }
+      notify(null, plain);
+      return plain;
+    })();
+
+    const api = {
+      def,
+      plain,
+      store,
+      ready,
+      get(key) { return key in def ? plain[key] : undefined; },
+      set(key, value) { return setValue(key, value); },
+      getAll() { return {...plain}; },
+      updateSchema,
+      subscribe(listener) {
+        if (typeof listener !== 'function') return () => {};
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+      toJSON() { return {...plain}; },
+      use(filter) {
+        const React = _reactRuntime;
+        if (!React?.useReducer || !React?.useEffect) {
+          throw new Error('settingsStore.use() requires __reflux.react.ready to resolve first.');
+        }
+
+        const keys = Array.isArray(filter) ? filter : null;
+        const [, forceUpdate] = React.useReducer((value) => value + 1, 0);
+        React.useEffect(() => api.subscribe((key) => {
+          if (!keys || key === null || keys.includes(key)) forceUpdate();
+        }), []);
+        return keys
+          ? Object.fromEntries(keys.map((key) => [key, plain[key]]))
+          : {...plain};
+      },
+    };
+
+    _settingsStores.set(pluginName, api);
+    return api;
+  }
+
+  const settings = {
+    createStore: createSettingsStore,
+    getStore(pluginName) { return _settingsStores.get(pluginName) ?? null; },
+    getSchema(pluginName) { return _settingsSchemas.get(pluginName) ?? []; },
+    registerSchema: registerSettingsSchema,
+    get(pluginName, key, defaultValue) {
+      const store = _settingsStores.get(pluginName);
+      if (store) {
+        const value = store.get(key);
+        return value === undefined ? defaultValue : value;
+      }
+      return window.refluxBridge?.getSetting(fullSettingKey(pluginName, key), defaultValue)
+        ?? defaultValue;
+    },
+    set(pluginName, key, value) {
+      const store = _settingsStores.get(pluginName);
+      if (store) return store.set(key, value);
+      return window.refluxBridge?.setSetting(fullSettingKey(pluginName, key), value);
+    },
+  };
+
+  /**
+   * Normalize a plugin definition and automatically create its settings store.
+   * Renderer plugins can use this the same way main-process plugins use
+   * src/core/pluginApi.js.
+   */
+  function definePlugin(definition) {
+    const plugin = normalizePluginDefinition(definition);
+    if (Array.isArray(plugin.settings) && plugin.settings.length) {
+      plugin.settingsStore = createSettingsStore(plugin.name, plugin.settings);
+    }
+    return plugin;
+  }
 
   // ---------------------------------------------------------------------------
   // Webpack patcher
@@ -949,6 +1194,10 @@
         console.warn(`[Reflux] Plugin "${plugin.name}" already registered.`);
         return;
       }
+      if (plugin.name && plugin.settings && !plugin.settingsStore) {
+        try { plugin.settingsStore = createSettingsStore(plugin.name, plugin.settings); }
+        catch (err) { console.error(`[Reflux] Could not create settings store for "${plugin.name}":`, err); }
+      }
       let cleanup = null;
       try {
         const result = plugin.start?.(patcher, __reflux);
@@ -983,6 +1232,9 @@
     contextMenu,
     pluginManager,
     events,
+    settings,
+    definePlugin,
+    OptionType,
   };
 
   Object.defineProperty(window, '__reflux', {

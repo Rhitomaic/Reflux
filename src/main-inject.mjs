@@ -34,6 +34,7 @@ const require = createRequire(import.meta.url);
 const REFLUX_ROOT    = nodePath.resolve(__dirname, '..');
 const RENDERER_PATH  = nodePath.join(REFLUX_ROOT, 'src', 'renderer.js');
 const PRELOAD_PATH   = nodePath.join(REFLUX_ROOT, 'src', 'preload.js');
+const PLUGIN_SCHEMA_PATH = nodePath.join(REFLUX_ROOT, 'src', 'core', 'pluginSchema.js');
 
 // ---------------------------------------------------------------------------
 // Bootstrap core modules
@@ -112,12 +113,16 @@ function getFluxerWebContents() {
   });
 }
 
-/** Cache renderer.js contents to avoid re-reading on every new window. */
+/** Cache renderer bootstrap contents to avoid re-reading on every new window. */
 let _rendererScript = null;
 function getRendererScript() {
   if (_rendererScript !== null) return _rendererScript;
   try {
-    _rendererScript = nodeFs.readFileSync(RENDERER_PATH, 'utf8');
+    // pluginSchema.js installs window.__refluxPluginSchema, which renderer.js
+    // uses for definePlugin()/OptionType in the web context.
+    const schemaScript = nodeFs.readFileSync(PLUGIN_SCHEMA_PATH, 'utf8');
+    const rendererScript = nodeFs.readFileSync(RENDERER_PATH, 'utf8');
+    _rendererScript = `${schemaScript}\n${rendererScript}`;
     return _rendererScript;
   } catch (err) {
     console.error('[Reflux:Main] Cannot read renderer.js:', err.message);

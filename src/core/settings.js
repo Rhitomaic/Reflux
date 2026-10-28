@@ -49,6 +49,16 @@ const LEGACY_SETTINGS_FILE = path.join(HOME, 'AppData', 'Roaming', 'Reflux', 'se
 /** @type {Record<string, any>|null} */
 let _cache = null;
 
+/** @type {Set<(key: string, value: any) => void>} */
+const _listeners = new Set();
+
+function _notify(key, value) {
+  for (const listener of _listeners) {
+    try { listener(key, value); }
+    catch (err) { console.error('[Reflux:Settings] Listener threw:', err); }
+  }
+}
+
 function _migrateLegacySettings() {
   if (path.resolve(SETTINGS_FILE) === path.resolve(LEGACY_SETTINGS_FILE)) return;
   if (fs.existsSync(SETTINGS_FILE) || !fs.existsSync(LEGACY_SETTINGS_FILE)) return;
@@ -136,6 +146,7 @@ function set(key, value) {
   if (!parent) { console.error('[Reflux:Settings] Invalid key:', key); return; }
   parent[lastKey] = value;
   _save();
+  _notify(key, value);
 }
 
 /**
@@ -144,7 +155,11 @@ function set(key, value) {
 function remove(key) {
   _load();
   const { parent, key: lastKey } = _traverse(_cache, key);
-  if (parent) { delete parent[lastKey]; _save(); }
+  if (parent) {
+    delete parent[lastKey];
+    _save();
+    _notify(key, undefined);
+  }
 }
 
 /**
@@ -153,6 +168,19 @@ function remove(key) {
 function getAll() {
   _load();
   return JSON.parse(JSON.stringify(_cache)); // deep clone to prevent mutation
+}
+
+/**
+ * Subscribe to changes made through this settings module (including IPC writes
+ * from the renderer).
+ *
+ * @param {(key: string, value: any) => void} listener
+ * @returns {() => void}
+ */
+function subscribe(listener) {
+  if (typeof listener !== 'function') return () => {};
+  _listeners.add(listener);
+  return () => _listeners.delete(listener);
 }
 
 // ---------------------------------------------------------------------------
@@ -177,4 +205,4 @@ function registerIpc(ipcMain) {
   ipcMain.handle(CH.GET_ALL,     ()                          => getAll());
 }
 
-module.exports = { get, set, remove, getAll, registerIpc, SETTINGS_FILE };
+module.exports = { get, set, remove, getAll, subscribe, registerIpc, SETTINGS_FILE };
