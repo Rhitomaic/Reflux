@@ -2532,6 +2532,9 @@
   /** @type {Set<Function|object>} */
   const _nativeMenuProviders = new Set();
   let _nativeMenuModule = null;
+  let _nativeMenuManager = null;
+  let _nativeMenuManagerPatched = false;
+  let _nativeMenuNamespacePatched = false;
   let _nativeMenuWatcher = null;
   let _nativeMenuGroupCache;
 
@@ -2540,6 +2543,13 @@
       typeof value.openFromEvent === 'function' &&
       typeof value.openAtPoint === 'function' &&
       typeof value.close === 'function';
+  }
+
+  function _nativeMenuManagerPredicate(value) {
+    return value &&
+      typeof value.open === 'function' &&
+      typeof value.close === 'function' &&
+      typeof value.getContextMenu === 'function';
   }
 
   function _nativeMenuTarget(value) {
@@ -2661,9 +2671,63 @@
     return _react.createElement(_react.Fragment, null, original, ...groups);
   }
 
+  function _patchNativeContextMenuManager(manager) {
+    if (!manager || !_nativeMenuManagerPredicate(manager) || _nativeMenuManagerPatched || _nativeMenuNamespacePatched) return false;
+    let target = manager;
+    if (!Object.prototype.hasOwnProperty.call(manager, 'open')) {
+      const proto = Object.getPrototypeOf(manager);
+      if (proto && typeof proto.open === 'function') target = proto;
+    }
+    if (target[NATIVE_CONTEXT_PATCH]) {
+      _nativeMenuManagerPatched = true;
+      return false;
+    }
+
+    const original = target.open;
+    const patched = function refluxNativeContextMenuOpen(entry, ...rest) {
+      try {
+        if (entry && typeof entry.render === 'function') {
+          const originalRender = entry.render;
+          const point = entry.target && Number.isFinite(entry.target.x) && Number.isFinite(entry.target.y)
+            ? {x: entry.target.x, y: entry.target.y}
+            : null;
+          const info = {
+            method: 'native',
+            event: null,
+            target: entry.target?.target ?? null,
+            point,
+            config: entry.config,
+            module: _nativeMenuModule,
+            entry,
+            api: __reflux,
+          };
+          entry.render = (api) => _wrapNativeRender(originalRender, info, api);
+        }
+      } catch (err) {
+        console.warn('[Reflux:ContextMenu] Could not wrap native menu entry:', err);
+      }
+      return original.apply(this, [entry, ...rest]);
+    };
+
+    try {
+      Object.defineProperty(patched, NATIVE_CONTEXT_PATCH, {value: true});
+      Object.defineProperty(target, NATIVE_CONTEXT_PATCH, {value: patched, configurable: true});
+      target.open = patched;
+      _nativeMenuManager = manager;
+      _nativeMenuManagerPatched = true;
+      console.log('[Reflux:ContextMenu] Native context-menu manager hooked.');
+      return true;
+    } catch (err) {
+      console.warn('[Reflux:ContextMenu] Could not patch native menu manager:', err);
+      return false;
+    }
+  }
+
   function _patchNativeMenuModule(module) {
     if (!module || !_nativeMenuPredicate(module)) return false;
     _nativeMenuModule = module;
+    if (_nativeMenuManagerPatched) return true;
+    let patchedAny = false;
 
     for (const method of NATIVE_OPEN_METHODS) {
       const original = module[method];
@@ -2680,31 +2744,41 @@
       try {
         Object.defineProperty(patched, NATIVE_CONTEXT_PATCH, {value: true});
         module[method] = patched;
-      } catch (err) {
-        console.warn(`[Reflux:ContextMenu] Could not patch native ${method}:`, err);
+        patchedAny = true;
+      } catch {
+        // Webpack exports are normally getter-only. The manager hook above is
+        // the reliable path; this fallback is only for non-webpack builds.
       }
     }
+    _nativeMenuNamespacePatched = _nativeMenuNamespacePatched || patchedAny;
     return true;
   }
 
   function _ensureNativeMenuPatch() {
+    const manager = _firstNestedExport(_nativeMenuManagerPredicate);
+    if (manager?.value) _patchNativeContextMenuManager(manager.value);
+
     if (!_nativeMenuModule) {
       const found = _firstNestedExport(_nativeMenuPredicate);
       if (found?.value) _patchNativeMenuModule(found.value);
+    } else if (!_nativeMenuManagerPatched) {
+      _patchNativeMenuModule(_nativeMenuModule);
     }
 
     if (!_nativeMenuWatcher) {
       _nativeMenuWatcher = patcher.patch(
-        (exports) => _nestedExportValues(exports).some(_nativeMenuPredicate),
+        (exports) => _nestedExportValues(exports).some((value) =>
+          _nativeMenuPredicate(value) || _nativeMenuManagerPredicate(value)),
         (exports) => {
           for (const value of _nestedExportValues(exports)) {
+            if (_nativeMenuManagerPredicate(value)) _patchNativeContextMenuManager(value);
             if (_nativeMenuPredicate(value)) _patchNativeMenuModule(value);
           }
           return exports;
         },
       );
     }
-    return Boolean(_nativeMenuModule);
+    return Boolean(_nativeMenuModule || _nativeMenuManagerPatched);
   }
 
   const nativeContextMenu = {
