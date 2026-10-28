@@ -43,26 +43,20 @@ const PLUGIN_SCHEMA_PATH = nodePath.join(REFLUX_ROOT, 'src', 'core', 'pluginSche
 const settings      = require('./core/settings.js');
 const pluginData    = require('./core/pluginData.js');
 const pluginManager = require('./core/pluginManager.js');
+const pluginIpc     = require('./core/pluginIpc.js');
+const pluginWatcher = require('./core/pluginWatcher.js');
 
 // Register IPC handlers immediately (before app.whenReady so handlers are in
 // place by the time any renderer tries to call them).
 settings.registerIpc(ipcMain);
 pluginData.registerIpc(ipcMain);
+pluginIpc.registerIpc(ipcMain);
 pluginManager.registerIpc(ipcMain, {
   // Inject (or re-inject) a plugin's renderer script into all live Fluxer tabs.
   // The plugin's renderer-side IIFE must reset its own guard flag in stop() for
   // re-injection to take effect after a disable → re-enable cycle.
   async onRendererEnable(plugin) {
-    let src;
-    try { src = nodeFs.readFileSync(plugin.rendererSrc, 'utf8'); }
-    catch (err) {
-      console.error(`[Reflux:Main] Cannot read renderer src for "${plugin.name}":`, err.message);
-      return;
-    }
-    for (const wc of getFluxerWebContents()) {
-      await wc.executeJavaScript(src).catch(e =>
-        console.error(`[Reflux:Main] Live-enable "${plugin.name}" failed:`, e.message));
-    }
+    await injectRendererPlugin(plugin, {unregisterFirst: false});
   },
 
   // Unregister a plugin from all live Fluxer tabs, calling its stop() in the renderer.
@@ -72,6 +66,11 @@ pluginManager.registerIpc(ipcMain, {
       await wc.executeJavaScript(script).catch(e =>
         console.error(`[Reflux:Main] Live-disable "${name}" failed:`, e.message));
     }
+  },
+
+  // Hot reload: stop the old renderer instance, then execute the new bundle.
+  async onRendererReload(plugin) {
+    await injectRendererPlugin(plugin, {unregisterFirst: true});
   },
 });
 
@@ -127,6 +126,31 @@ function getRendererScript() {
   } catch (err) {
     console.error('[Reflux:Main] Cannot read renderer.js:', err.message);
     return null;
+  }
+}
+
+/**
+ * Read and inject one plugin's renderer-side script into every live Fluxer tab.
+ * @param {object} plugin
+ * @param {{unregisterFirst?: boolean}} [options]
+ */
+async function injectRendererPlugin(plugin, {unregisterFirst = false} = {}) {
+  if (!plugin?.rendererSrc) return;
+  let src;
+  try { src = nodeFs.readFileSync(plugin.rendererSrc, 'utf8'); }
+  catch (err) {
+    console.error(`[Reflux:Main] Cannot read renderer src for "${plugin.name}":`, err.message);
+    return;
+  }
+
+  for (const wc of getFluxerWebContents()) {
+    if (unregisterFirst) {
+      const unregister = `void window.__reflux?.pluginManager.unregister(${JSON.stringify(plugin.name)})`;
+      await wc.executeJavaScript(unregister).catch(e =>
+        console.error(`[Reflux:Main] Live-unload "${plugin.name}" failed:`, e.message));
+    }
+    await wc.executeJavaScript(src).catch(e =>
+      console.error(`[Reflux:Main] Live-inject "${plugin.name}" failed:`, e.message));
   }
 }
 
@@ -187,6 +211,8 @@ function stripCsp(targetSession) {
 // Boot
 // ---------------------------------------------------------------------------
 
+let hotReloadWatcher = null;
+
 app.on('web-contents-created', (_event, wc) => {
   wc.on('dom-ready', () => {
     if (!settings.get('reflux.enabled', true)) return;
@@ -207,12 +233,40 @@ app.whenReady().then(() => {
   // after app ready because plugins may touch Electron session APIs.
   pluginManager.loadAll();
 
+  if (settings.get('reflux.hotReload', true)) {
+    hotReloadWatcher = pluginWatcher.start({
+      getDirectories: () => pluginManager.directories(),
+      async onChange(dir) {
+        if (!settings.get('reflux.hotReload', true)) return;
+        const name = pluginManager.nameForDirectory(dir);
+        if (name) {
+          const result = pluginManager.reload(name);
+          if (result?.enabled && !result.error && result.plugin) {
+            await injectRendererPlugin(result.plugin, {unregisterFirst: true});
+          }
+          return;
+        }
+
+        // New plugin directory: load it and inject its renderer if enabled.
+        const plugin = pluginManager.loadDirectory(dir);
+        if (!plugin) return;
+        const info = pluginManager.list().find((entry) => entry.name === plugin.name);
+        if (info?.enabled) await injectRendererPlugin(plugin, {unregisterFirst: true});
+      },
+    });
+  }
+
   console.log(
     `[Reflux:Main] Ready. Settings: ${settings.SETTINGS_FILE}\n` +
     `[Reflux:Main] Active plugins: ${pluginManager.list().filter(p => p.started).map(p => p.name).join(', ') || '(none)'}`
   );
 }).catch(err => {
   console.error('[Reflux:Main] app.whenReady() error:', err);
+});
+
+app.on('before-quit', () => {
+  hotReloadWatcher?.stop();
+  hotReloadWatcher = null;
 });
 
 console.log('[Reflux:Main] Bootstrap loaded.');

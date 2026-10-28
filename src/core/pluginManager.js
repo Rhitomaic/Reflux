@@ -31,6 +31,7 @@ const path    = require('node:path');
 const settings = require('./settings');
 const pluginSchema = require('./pluginSchema');
 const pluginSettings = require('./pluginSettings');
+const pluginIpc = require('./pluginIpc');
 
 // ---------------------------------------------------------------------------
 // State
@@ -45,6 +46,7 @@ const IPC_CH = {
   LIST:    'reflux:plugin-list',
   ENABLE:  'reflux:plugin-enable',
   DISABLE: 'reflux:plugin-disable',
+  RELOAD:  'reflux:plugin-reload',
 };
 
 // ---------------------------------------------------------------------------
@@ -84,6 +86,16 @@ function _loadPlugin(pluginDir) {
   if (plugin.settings.length && !plugin.settingsStore) {
     plugin.settingsStore = pluginSettings.createStore(plugin.name, plugin.settings);
   }
+
+  plugin.nativeIpc = pluginIpc.forPlugin(plugin.name);
+  if (!plugin.ipc || typeof plugin.ipc !== 'object') plugin.ipc = plugin.nativeIpc;
+  try {
+    Object.defineProperty(plugin, '_dir', {
+      value: pluginDir,
+      configurable: true,
+      enumerable: false,
+    });
+  } catch { /* plugin objects are normally extensible */ }
   return plugin;
 }
 
@@ -122,32 +134,128 @@ function loadAll() {
   }
 }
 
+function _registerPluginIpc(plugin) {
+  if (!plugin?.name) return;
+  pluginIpc.removePlugin(plugin.name);
+  const handlers = plugin.ipcHandlers;
+  if (!handlers || typeof handlers !== 'object') return;
+  for (const [channel, handler] of Object.entries(handlers)) {
+    if (typeof handler !== 'function') continue;
+    try { pluginIpc.registerHandler(plugin.name, channel, handler); }
+    catch (err) { console.error(`[Reflux:PluginManager] Invalid IPC handler "${channel}" for "${plugin.name}":`, err); }
+  }
+}
+
 function startPlugin(name) {
   const entry = _registry.get(name);
   if (!entry || entry.started) return;
   try {
+    _registerPluginIpc(entry.module);
     entry.module.start();
     entry.started = true;
     console.log(`[Reflux:PluginManager] Started "${name}".`);
   } catch (err) {
+    pluginIpc.removePlugin(name);
     console.error(`[Reflux:PluginManager] "${name}".start() threw:`, err);
   }
 }
 
 function stopPlugin(name) {
   const entry = _registry.get(name);
-  if (!entry || !entry.started) return;
+  if (!entry || !entry.started) {
+    pluginIpc.removePlugin(name);
+    return;
+  }
   try {
     entry.module.stop();
     entry.started = false;
     console.log(`[Reflux:PluginManager] Stopped "${name}".`);
   } catch (err) {
     console.error(`[Reflux:PluginManager] "${name}".stop() threw:`, err);
+  } finally {
+    pluginIpc.removePlugin(name);
   }
 }
 
 function stopAll() {
   for (const name of _registry.keys()) stopPlugin(name);
+}
+
+/**
+ * Load a plugin directory that was added after startup.
+ * @param {string} pluginDir
+ * @returns {object|null}
+ */
+function loadDirectory(pluginDir) {
+  const known = nameForDirectory(pluginDir);
+  if (known) return _registry.get(known)?.module ?? null;
+  const plugin = _loadPlugin(pluginDir);
+  if (!plugin) return null;
+  if (_registry.has(plugin.name)) return _registry.get(plugin.name)?.module ?? null;
+  _registry.set(plugin.name, {module: plugin, started: false, dir: pluginDir});
+  if (_isEnabled(plugin.name)) startPlugin(plugin.name);
+  return plugin;
+}
+
+/**
+ * Re-read a plugin's index.js, restart it, and return the new module.
+ * Renderer re-injection is handled by the caller.
+ *
+ * @param {string} name
+ * @returns {{name: string, plugin: object|null, enabled: boolean, started: boolean, error?: string}|null}
+ */
+function reload(name) {
+  const entry = _registry.get(name);
+  if (!entry) return null;
+
+  const pluginDir = entry.dir || entry.module?._dir;
+  if (!pluginDir) return {name, plugin: entry.module, enabled: _isEnabled(name), started: entry.started, error: 'Unknown plugin directory.'};
+
+  const wasEnabled = _isEnabled(name);
+  const wasStarted = entry.started;
+  const indexPath = path.join(pluginDir, 'index.js');
+  stopPlugin(name);
+  try { delete require.cache[require.resolve(indexPath)]; }
+  catch { /* not cached */ }
+
+  const next = _loadPlugin(pluginDir);
+  if (!next || next.name !== name) {
+    // Keep the previous module available if the edited file is invalid.
+    _registry.set(name, entry);
+    if (wasEnabled && wasStarted) startPlugin(name);
+    return {
+      name,
+      plugin: entry.module,
+      enabled: wasEnabled,
+      started: Boolean(_registry.get(name)?.started),
+      error: 'Reload failed; previous plugin restored.',
+    };
+  }
+
+  _registry.set(name, {module: next, started: false, dir: pluginDir});
+  if (wasEnabled) startPlugin(name);
+  console.log(`[Reflux:PluginManager] Reloaded "${name}".`);
+  return {
+    name,
+    plugin: next,
+    enabled: wasEnabled,
+    started: Boolean(_registry.get(name)?.started),
+  };
+}
+
+function directories() {
+  return Array.from(_registry.entries())
+    .map(([name, entry]) => ({name, dir: entry.dir || entry.module?._dir || null}))
+    .filter((entry) => Boolean(entry.dir));
+}
+
+function nameForDirectory(pluginDir) {
+  const resolved = path.resolve(pluginDir);
+  for (const [name, entry] of _registry) {
+    const dir = entry.dir || entry.module?._dir;
+    if (dir && path.resolve(dir) === resolved) return name;
+  }
+  return null;
 }
 
 function enablePlugin(name) {
@@ -185,11 +293,12 @@ function list() {
  *
  * @param {Electron.IpcMain} ipcMain
  * @param {{ onRendererEnable?: (plugin: object) => Promise<void>,
- *            onRendererDisable?: (name: string) => Promise<void> }} [callbacks]
- *   Optional hooks called after the main-process enable/disable so the caller
- *   can push the change into live Fluxer web contents without a restart.
+ *            onRendererDisable?: (name: string) => Promise<void>,
+ *            onRendererReload?: (plugin: object) => Promise<void> }} [callbacks]
+ *   Optional hooks called after the main-process change so the caller can push
+ *   the change into live Fluxer web contents without a restart.
  */
-function registerIpc(ipcMain, { onRendererEnable, onRendererDisable } = {}) {
+function registerIpc(ipcMain, { onRendererEnable, onRendererDisable, onRendererReload } = {}) {
   ipcMain.handle(IPC_CH.LIST, () => list());
 
   ipcMain.handle(IPC_CH.ENABLE, async (_e, name) => {
@@ -208,6 +317,28 @@ function registerIpc(ipcMain, { onRendererEnable, onRendererDisable } = {}) {
         console.error(`[Reflux:PluginManager] onRendererDisable("${name}") threw:`, err));
     }
   });
+
+  ipcMain.handle(IPC_CH.RELOAD, async (_e, name) => {
+    const result = reload(name);
+    if (result?.enabled && !result.error && onRendererReload) {
+      await onRendererReload(result.plugin).catch(err =>
+        console.error(`[Reflux:PluginManager] onRendererReload("${name}") threw:`, err));
+    }
+    return result;
+  });
 }
 
-module.exports = { loadAll, stopAll, startPlugin, stopPlugin, enablePlugin, disablePlugin, list, registerIpc };
+module.exports = {
+  loadAll,
+  stopAll,
+  startPlugin,
+  stopPlugin,
+  enablePlugin,
+  disablePlugin,
+  loadDirectory,
+  reload,
+  directories,
+  nameForDirectory,
+  list,
+  registerIpc,
+};
