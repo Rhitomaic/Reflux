@@ -313,6 +313,31 @@
 
   /** @type {Function|null}  Webpack's internal require function. */
   let _webpackRequire = null;
+  let _webpackReadySettled = false;
+  let _resolveWebpackReady = null;
+  const _webpackReady = new Promise((resolve) => { _resolveWebpackReady = resolve; });
+  const _webpackReadyListeners = new Set();
+
+  function onWebpackReady(listener) {
+    if (typeof listener !== 'function') return () => {};
+    if (_webpackReadySettled) {
+      try { listener(_webpackRequire); } catch (err) { console.error('[Reflux:Webpack] onReady listener threw:', err); }
+      return () => {};
+    }
+    _webpackReadyListeners.add(listener);
+    return () => _webpackReadyListeners.delete(listener);
+  }
+
+  function _markWebpackReady() {
+    if (_webpackReadySettled) return;
+    _webpackReadySettled = true;
+    _resolveWebpackReady?.(_webpackRequire);
+    for (const listener of Array.from(_webpackReadyListeners)) {
+      _webpackReadyListeners.delete(listener);
+      try { listener(_webpackRequire); }
+      catch (err) { console.error('[Reflux:Webpack] onReady listener threw:', err); }
+    }
+  }
 
   /**
    * Apply all registered patches whose filter matches `exports`.
@@ -401,6 +426,7 @@
    */
   function _wrapWebpackRequire(wpRequire) {
     _webpackRequire = wpRequire;
+    _markWebpackReady();
 
     const originalRequire = wpRequire.bind({});
 
@@ -735,6 +761,8 @@
     },
 
     events,
+    ready: _webpackReady,
+    onReady: onWebpackReady,
   };
 
   function _patchMethod(target, method, invoke) {
@@ -750,6 +778,291 @@
   }
 
   let _uiNavigationInProgress = false;
+
+  // ---------------------------------------------------------------------------
+  // React + Fluxer component kit
+  // ---------------------------------------------------------------------------
+
+  let _react = null;
+  let _reactDOM = null;
+  let _errorBoundaryClass = null;
+  let _resolveReactReady = null;
+  let _reactReadySettled = false;
+  const _reactReady = new Promise((resolve) => { _resolveReactReady = resolve; });
+  const _reactRoots = new WeakMap();
+  const _componentCache = new Map();
+
+  function reactCandidateFromExports(exports) {
+    if (!exports) return null;
+    const candidates = [exports, exports.default, exports.React, exports.react];
+    for (const candidate of candidates) {
+      if (!candidate || (typeof candidate !== 'object' && typeof candidate !== 'function')) continue;
+      if (typeof candidate.createElement === 'function' &&
+          typeof candidate.useState === 'function' &&
+          typeof candidate.useEffect === 'function' &&
+          typeof candidate.createContext === 'function' &&
+          typeof candidate.Component === 'function' &&
+          candidate.Fragment !== undefined) {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  function reactDOMCandidateFromExports(exports) {
+    if (!exports) return null;
+    const candidates = [exports, exports.default];
+    for (const candidate of candidates) {
+      if (!candidate || (typeof candidate !== 'object' && typeof candidate !== 'function')) continue;
+      if (typeof candidate.createRoot === 'function' &&
+          (typeof candidate.flushSync === 'function' || typeof candidate.hydrateRoot === 'function')) {
+        return candidate;
+      }
+      if (typeof candidate.render === 'function' && typeof candidate.unmountComponentAtNode === 'function') {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  function settleReactReady(value) {
+    if (_reactReadySettled) return;
+    _reactReadySettled = true;
+    _resolveReactReady?.(value);
+  }
+
+  function installReact(React) {
+    if (_react || !React) return;
+    _react = React;
+    _reactRuntime = React;
+    _errorBoundaryClass = createErrorBoundaryClass(React);
+    components.ErrorBoundary = ErrorBoundary;
+    settleReactReady(React);
+    console.log('[Reflux:React] React runtime discovered.');
+  }
+
+  function installReactDOM(ReactDOM) {
+    if (_reactDOM || !ReactDOM) return;
+    _reactDOM = ReactDOM;
+    console.log('[Reflux:React] ReactDOM runtime discovered.');
+  }
+
+  function findReactNow() {
+    const matches = patcher.findModules((exports) => Boolean(reactCandidateFromExports(exports)));
+    for (const match of matches) {
+      const React = reactCandidateFromExports(match.exports);
+      if (React) { installReact(React); return true; }
+    }
+    return false;
+  }
+
+  function findReactDOMNow() {
+    const matches = patcher.findModules((exports) => Boolean(reactDOMCandidateFromExports(exports)));
+    for (const match of matches) {
+      const ReactDOM = reactDOMCandidateFromExports(match.exports);
+      if (ReactDOM) { installReactDOM(ReactDOM); return true; }
+    }
+    return false;
+  }
+
+  function watchForReact() {
+    if (findReactNow()) return;
+    let unpatch = null;
+    unpatch = patcher.patch(
+      (exports) => Boolean(reactCandidateFromExports(exports)),
+      (exports) => {
+        const React = reactCandidateFromExports(exports);
+        if (React) {
+          installReact(React);
+          try { unpatch?.(); } catch { /* already removed */ }
+        }
+      },
+    );
+  }
+
+  function watchForReactDOM() {
+    if (findReactDOMNow()) return;
+    let unpatch = null;
+    unpatch = patcher.patch(
+      (exports) => Boolean(reactDOMCandidateFromExports(exports)),
+      (exports) => {
+        const ReactDOM = reactDOMCandidateFromExports(exports);
+        if (ReactDOM) {
+          installReactDOM(ReactDOM);
+          try { unpatch?.(); } catch { /* already removed */ }
+        }
+      },
+    );
+  }
+
+  function createErrorBoundaryClass(React) {
+    return class RefluxErrorBoundary extends React.Component {
+      constructor(props) {
+        super(props);
+        this.state = {error: null};
+      }
+
+      static getDerivedStateFromError(error) {
+        return {error};
+      }
+
+      componentDidCatch(error, info) {
+        const name = this.props?.name || 'plugin component';
+        console.error(`[Reflux] ${name} failed to render:`, error, info);
+        try { this.props?.onError?.(error, info); }
+        catch (err) { console.error('[Reflux] ErrorBoundary onError threw:', err); }
+      }
+
+      render() {
+        if (this.state.error) {
+          const fallback = this.props?.fallback;
+          if (typeof fallback === 'function') return fallback(this.state.error);
+          return fallback === undefined ? null : fallback;
+        }
+        return this.props?.children ?? null;
+      }
+    };
+  }
+
+  function ErrorBoundary(props) {
+    if (!_react) return props?.children ?? null;
+    const Bound = _errorBoundaryClass ?? (_errorBoundaryClass = createErrorBoundaryClass(_react));
+    return _react.createElement(Bound, props);
+  }
+
+  function normalizeReactElement(element) {
+    if (!_react) throw new Error('React runtime is not ready. Await __reflux.react.ready first.');
+    return _react.isValidElement(element) ? element : _react.createElement(element);
+  }
+
+  const reactApi = {
+    get React() { return _react; },
+    get ReactDOM() { return _reactDOM; },
+    ready: _reactReady,
+    ErrorBoundary,
+    getReact: () => _react,
+    getReactDOM: () => _reactDOM,
+    createElement(...args) {
+      if (!_react) throw new Error('React runtime is not ready.');
+      return _react.createElement(...args);
+    },
+    render(element, container) {
+      if (!_react || !_reactDOM) throw new Error('React/ReactDOM runtime is not ready.');
+      if (!container) throw new Error('react.render() requires a container element.');
+
+      const next = normalizeReactElement(element);
+      let root = _reactRoots.get(container);
+
+      if (!root) {
+        if (typeof _reactDOM.createRoot === 'function') {
+          container.textContent = '';
+          root = _reactDOM.createRoot(container);
+          _reactRoots.set(container, root);
+        } else if (typeof _reactDOM.render === 'function') {
+          _reactDOM.render(next, container);
+          container.dataset.refluxReactRoot = 'true';
+          return () => reactApi.unmount(container);
+        } else {
+          throw new Error('ReactDOM does not expose createRoot() or render().');
+        }
+      }
+
+      root.render(next);
+      container.dataset.refluxReactRoot = 'true';
+      return () => reactApi.unmount(container);
+    },
+    unmount(container) {
+      if (!container) return;
+      const root = _reactRoots.get(container);
+      if (root?.unmount) {
+        try { root.unmount(); } catch { /* already unmounted */ }
+        _reactRoots.delete(container);
+      } else if (_reactDOM?.unmountComponentAtNode) {
+        try { _reactDOM.unmountComponentAtNode(container); } catch { /* ignore */ }
+      }
+      if (container.dataset) delete container.dataset.refluxReactRoot;
+    },
+    unmountWithin(container) {
+      if (!container) return;
+      if (container.dataset?.refluxReactRoot) reactApi.unmount(container);
+      for (const element of container.querySelectorAll?.('[data-reflux-react-root]') ?? []) {
+        reactApi.unmount(element);
+      }
+    },
+  };
+
+  const COMPONENT_NAMES = [
+    'Button',
+    'Switch',
+    'FormSwitch',
+    'FormInput',
+    'FormCombobox',
+    'Clickable',
+    'Flex',
+    'Text',
+    'Menu',
+    'Tooltip',
+    'Modal',
+    'Spinner',
+  ];
+
+  function findComponentNow(name) {
+    if (_componentCache.has(name)) return _componentCache.get(name);
+    let component = patcher.findByName(name);
+    if (!component) {
+      const module = patcher.findByProps(name);
+      const candidate = module?.[name];
+      if (candidate && (typeof candidate === 'function' || typeof candidate === 'object')) {
+        component = candidate;
+      }
+    }
+    if (component) _componentCache.set(name, component);
+    return component ?? null;
+  }
+
+  const components = {
+    available: [...COMPONENT_NAMES],
+    ErrorBoundary,
+    find(name) { return findComponentNow(name); },
+    get(name) { return findComponentNow(name); },
+    waitFor(name, {timeout = 10000, interval = 250} = {}) {
+      const existing = findComponentNow(name);
+      if (existing) return Promise.resolve(existing);
+      return new Promise((resolve) => {
+        const started = Date.now();
+        const timer = setInterval(() => {
+          const component = findComponentNow(name);
+          if (component || (timeout > 0 && Date.now() - started >= timeout)) {
+            clearInterval(timer);
+            resolve(component ?? null);
+          }
+        }, interval);
+      });
+    },
+    clearCache() { _componentCache.clear(); },
+  };
+
+  for (const name of COMPONENT_NAMES) {
+    Object.defineProperty(components, name, {
+      enumerable: true,
+      get() { return findComponentNow(name); },
+    });
+  }
+
+  watchForReact();
+  watchForReactDOM();
+
+  onWebpackReady(() => {
+    findReactNow();
+    findReactDOMNow();
+  });
+
+  setTimeout(() => {
+    if (!_react) {
+      console.warn('[Reflux:React] React runtime was not discovered within 15 seconds.');
+      settleReactReady(null);
+    }
+  }, 15000);
 
   const ui = {
     find(selector, root = document) {
@@ -1235,6 +1548,8 @@
     settings,
     definePlugin,
     OptionType,
+    react: reactApi,
+    components,
   };
 
   Object.defineProperty(window, '__reflux', {

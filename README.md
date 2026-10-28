@@ -17,6 +17,8 @@
 - CSP stripping so injected renderer scripts load without restriction
 - Preload bridge registered with `session.setPreloads()` — Fluxer's own preload file is left untouched
 - Plugin lifecycle (`start`, `stop`, enable/disable with persistent state)
+- `definePlugin()` with typed settings schemas, reactive per-plugin settings stores, and schema-driven settings controls
+- Lazy React/ReactDOM discovery, a Fluxer component kit, and an ErrorBoundary for plugin UI
 - `contextBridge` IPC bridge exposing settings, plugin management, and plugin-owned data to the renderer
 - Gateway WebSocket interception for event hooks
 - Injected **Reflux** section inside Fluxer's native settings panel, including per-plugin settings

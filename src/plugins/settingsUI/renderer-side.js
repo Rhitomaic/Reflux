@@ -885,7 +885,15 @@
           } else if (result != null) {
             const react = window.__reflux?.react;
             if (react?.render) {
-              react.render(result, host);
+              const React = react.React;
+              const element = React && react.ErrorBoundary
+                ? React.createElement(
+                    react.ErrorBoundary,
+                    {name: `Custom setting "${label}"`, fallback: null},
+                    result,
+                  )
+                : result;
+              react.render(element, host);
             } else {
               const fallback = document.createElement('span');
               fallback.className = 'reflux-setting-fallback';
@@ -1025,6 +1033,7 @@
     }
 
     function renderSettings() {
+      window.__reflux?.react?.unmountWithin?.(settingsWrap);
       settingsWrap.innerHTML = '';
 
       for (const setting of settingSchema) {
@@ -1469,7 +1478,11 @@
   function hideRefluxPanel() {
     removeActiveStyle();
     if (_realPanel)  { _realPanel.style.display = ''; _realPanel = null; }
-    if (_ourPanel)   { _ourPanel.remove(); _ourPanel = null; }
+    if (_ourPanel)   {
+      window.__reflux?.react?.unmountWithin?.(_ourPanel);
+      _ourPanel.remove();
+      _ourPanel = null;
+    }
     if (_cleanupFn)  { _cleanupFn(); _cleanupFn = null; }
     document.getElementById('reflux-tab-plugins')?.setAttribute('aria-selected', 'false');
     document.getElementById('reflux-tab-plugins')?.setAttribute('tabindex', '-1');

@@ -370,6 +370,16 @@ const targetModule = findByCode('MESSAGE_CREATE', 'getChannel');
 than property or name lookups. All three finders return `null` when there is no
 match. They do not force lazy modules to load.
 
+If your plugin starts before Reflux has captured webpack's module cache, wait
+for it first:
+
+```js
+await window.__reflux.patcher.ready;
+```
+
+`patcher.ready` resolves once the cache is available, and
+`patcher.onReady(callback)` provides a callback form.
+
 For patching methods on a module or object, use `before`, `after`, or `instead`.
 Each returns an unpatch function and should be cleaned up from the plugin's
 `stop()` method:
@@ -434,6 +444,94 @@ the first matching element or `null` after its timeout. `injectCSS()` and
 `onNavigate()` return cleanup functions. `navigate()` uses the browser
 history API and dispatches `popstate`; it is intended for Fluxer routes that
 already respond to normal browser navigation.
+
+---
+
+## React runtime and Fluxer components
+
+Reflux discovers Fluxer's React and ReactDOM modules lazily and exposes them on
+`window.__reflux.react`. Wait for `ready` before using them:
+
+```js
+const {react, components} = window.__reflux;
+
+const React = await react.ready;
+if (!React) throw new Error('React was not found');
+
+const {createElement: h} = React;
+
+// Mount a React element into a DOM node.
+const host = document.createElement('div');
+document.body.appendChild(host);
+react.render(h('div', null, 'Hello from Reflux'), host);
+
+// Later
+react.unmount(host);
+```
+
+`react` also exposes `React`/`ReactDOM` getters, `getReact()`, `getReactDOM()`,
+`createElement()`, `render(element, container)`, `unmount(container)`, and
+`unmountWithin(container)`. `render()` returns an unmount function.
+
+### Component kit
+
+Common Fluxer components are available lazily:
+
+```js
+const Button = components.Button ?? await components.waitFor('Button');
+const Switch = await components.waitFor('Switch');
+
+components.find('Tooltip');     // search already-loaded modules
+components.waitFor('Modal');    // wait for lazy-loaded modules
+```
+
+The kit predefines getters for `Button`, `Switch`, `FormSwitch`, `FormInput`,
+`FormCombobox`, `Clickable`, `Flex`, `Text`, `Menu`, `Tooltip`, `Modal`, and
+`Spinner`. Availability depends on Fluxer's current build; always handle a
+`null` result.
+
+### ErrorBoundary
+
+Wrap plugin-rendered components so a crash does not take down the whole
+settings panel:
+
+```js
+const {react, components} = window.__reflux;
+const React = await react.ready;
+
+const node = React.createElement(
+  components.ErrorBoundary,
+  {
+    name: 'My plugin panel',
+    fallback: React.createElement('span', null, 'Something went wrong.'),
+  },
+  React.createElement(MyPanel),
+);
+```
+
+`ErrorBoundary` accepts `name`, `fallback`, and `onError(error, info)` props.
+It is also available as `react.ErrorBoundary`.
+
+### React-backed settings
+
+Once React is ready, plugin settings stores gain a `use()` hook:
+
+```js
+const plugin = window.__reflux.definePlugin({
+  name: 'myPlugin',
+  settings: {
+    showBadge: {type: window.__reflux.OptionType.BOOLEAN, default: true},
+  },
+});
+
+await window.__reflux.react.ready;
+const React = window.__reflux.react.React;
+
+function MyPanel() {
+  const {showBadge} = plugin.settingsStore.use(['showBadge']);
+  return React.createElement('span', null, showBadge ? 'On' : 'Off');
+}
+```
 
 ---
 
