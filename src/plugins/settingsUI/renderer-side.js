@@ -299,6 +299,114 @@
       color: rgb(107 114 128);
     }
 
+    .reflux-setting-row {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      min-height: 2.75rem;
+      padding: 0.5rem 0;
+    }
+    .reflux-setting-main {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      min-width: 0;
+    }
+    .reflux-setting-row-inline {
+      flex-direction: row;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+    .reflux-setting-text {
+      display: flex;
+      flex-direction: column;
+      gap: 0.25rem;
+      min-width: 0;
+    }
+    .reflux-setting-control {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      min-width: 0;
+    }
+    .reflux-setting-control-full {
+      width: 100%;
+    }
+    .reflux-setting-input,
+    .reflux-setting-select {
+      box-sizing: border-box;
+      min-height: 2.25rem;
+      padding: 0.4375rem 0.625rem;
+      border: 1px solid var(--background-modifier-accent, rgba(255, 255, 255, 0.08));
+      border-radius: 0.5rem;
+      background: var(--form-surface-background, var(--background-secondary, #2b2d31));
+      color: var(--text-primary, var(--text-normal, #dbdee1));
+      font: inherit;
+      font-size: 0.875rem;
+      line-height: 1.25rem;
+    }
+    .reflux-setting-input {
+      width: 100%;
+    }
+    textarea.reflux-setting-input {
+      min-height: 5.5rem;
+      resize: vertical;
+    }
+    .reflux-setting-select {
+      min-width: 9rem;
+      max-width: 100%;
+    }
+    .reflux-setting-control-full .reflux-setting-select {
+      width: 100%;
+    }
+    .reflux-setting-input:disabled,
+    .reflux-setting-select:disabled,
+    .reflux-setting-slider:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .reflux-setting-input:focus-visible,
+    .reflux-setting-select:focus-visible,
+    .reflux-setting-slider:focus-visible {
+      outline: 2px solid var(--brand-primary, var(--brand-500, #5865f2));
+      outline-offset: 1px;
+    }
+    .reflux-setting-slider-row {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      width: 100%;
+    }
+    .reflux-setting-slider {
+      width: 100%;
+      accent-color: var(--brand-primary, var(--brand-500, #5865f2));
+    }
+    .reflux-setting-value {
+      min-width: 2.5rem;
+      color: var(--text-secondary, var(--text-muted, #949ba4));
+      font-size: 0.8125rem;
+      font-variant-numeric: tabular-nums;
+      text-align: right;
+    }
+    .reflux-setting-error {
+      color: var(--status-danger, #ed4245);
+      font-size: 0.75rem;
+      line-height: 1.25rem;
+    }
+    .reflux-setting-custom {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      width: 100%;
+      min-width: 0;
+    }
+    .reflux-setting-fallback {
+      color: var(--text-tertiary, var(--text-muted, #949ba4));
+      font-size: 0.8125rem;
+      line-height: 1.35;
+    }
+
     .reflux-button {
       display: inline-flex;
       align-items: center;
@@ -602,6 +710,217 @@
 
   getImported().then(list => list.filter(p => p.enabled !== false).forEach(startImportedPlugin));
 
+  // ─── Setting controls ──────────────────────────────────────────────────────
+  function evaluateSettingFlag(flag, context) {
+    if (typeof flag === 'function') {
+      try { return Boolean(flag.call(context)); }
+      catch (err) {
+        console.error('[Reflux:SettingsUI] Setting flag threw:', err);
+        return false;
+      }
+    }
+    return Boolean(flag);
+  }
+
+  function settingLabel(setting) {
+    return setting.label || setting.displayName || setting.key;
+  }
+
+  function selectedOptionValue(setting, rawValue) {
+    const options = Array.isArray(setting.options) ? setting.options : [];
+    const match = options.find((option) => String(option.value) === String(rawValue));
+    return match ? match.value : rawValue;
+  }
+
+  function validateSetting(setting, value, values) {
+    if (typeof setting.isValid !== 'function') return true;
+    try {
+      const result = setting.isValid.call(values, value);
+      if (result === false) return 'Invalid value';
+      if (typeof result === 'string') return result;
+      return true;
+    } catch (err) {
+      console.error('[Reflux:SettingsUI] Setting validation threw:', err);
+      return 'Validation failed';
+    }
+  }
+
+  function makeSettingRow(setting, value, onChange, disabled, values) {
+    const type = setting.type || 'string';
+    const label = settingLabel(setting);
+    const description = setting.description || '';
+
+    if (type === 'boolean') {
+      return makeToggle(Boolean(value), onChange, {label, description, disabled}).el;
+    }
+
+    const row = document.createElement('div');
+    row.className = 'reflux-setting-row';
+
+    const main = document.createElement('div');
+    main.className = 'reflux-setting-main' + (type === 'select' ? ' reflux-setting-row-inline' : '');
+
+    const text = document.createElement('div');
+    text.className = 'reflux-setting-text';
+    if (label) {
+      const labelEl = document.createElement('span');
+      labelEl.className = 'reflux-switch-label';
+      labelEl.textContent = label;
+      text.appendChild(labelEl);
+    }
+    if (description) {
+      const descEl = document.createElement('span');
+      descEl.className = 'reflux-switch-description';
+      descEl.textContent = description;
+      text.appendChild(descEl);
+    }
+    main.appendChild(text);
+
+    const control = document.createElement('div');
+    control.className = 'reflux-setting-control' + (type === 'select' ? '' : ' reflux-setting-control-full');
+
+    const error = document.createElement('div');
+    error.className = 'reflux-setting-error';
+    error.hidden = true;
+
+    async function commit(nextValue) {
+      const validation = validateSetting(setting, nextValue, values);
+      if (validation !== true) {
+        error.hidden = false;
+        error.textContent = validation;
+        return;
+      }
+      error.hidden = true;
+      try { await onChange(nextValue); }
+      catch (err) {
+        console.error(`[Reflux:SettingsUI] Failed to save "${setting.key}":`, err);
+        error.hidden = false;
+        error.textContent = 'Could not save this setting.';
+      }
+    }
+
+    if (type === 'string') {
+      const input = document.createElement(setting.multiline ? 'textarea' : 'input');
+      input.className = 'reflux-setting-input';
+      if (!setting.multiline) input.type = 'text';
+      input.value = value ?? '';
+      input.disabled = disabled;
+      if (setting.placeholder) input.placeholder = setting.placeholder;
+      input.addEventListener('change', () => commit(input.value));
+      control.appendChild(input);
+    } else if (type === 'number') {
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.className = 'reflux-setting-input';
+      input.value = value ?? '';
+      input.disabled = disabled;
+      input.step = setting.step ?? 'any';
+      if (setting.min !== undefined) input.min = String(setting.min);
+      if (setting.max !== undefined) input.max = String(setting.max);
+      input.addEventListener('change', () => {
+        commit(input.value === '' ? setting.default ?? 0 : Number(input.value));
+      });
+      control.appendChild(input);
+    } else if (type === 'select') {
+      const select = document.createElement('select');
+      select.className = 'reflux-setting-select';
+      select.disabled = disabled;
+      for (const option of setting.options || []) {
+        const optionEl = document.createElement('option');
+        optionEl.value = String(option.value);
+        optionEl.textContent = option.label ?? String(option.value);
+        select.appendChild(optionEl);
+      }
+      select.value = String(value ?? '');
+      select.addEventListener('change', () => commit(selectedOptionValue(setting, select.value)));
+      control.appendChild(select);
+    } else if (type === 'slider') {
+      const markers = Array.isArray(setting.markers) && setting.markers.length
+        ? setting.markers
+        : [0, 100];
+      const min = Math.min(...markers);
+      const max = Math.max(...markers);
+
+      const sliderRow = document.createElement('div');
+      sliderRow.className = 'reflux-setting-slider-row';
+
+      const slider = document.createElement('input');
+      slider.type = 'range';
+      slider.className = 'reflux-setting-slider';
+      slider.min = String(min);
+      slider.max = String(max);
+      slider.step = String(setting.step ?? 1);
+      slider.value = String(value ?? setting.default ?? min);
+      slider.disabled = disabled;
+
+      const output = document.createElement('span');
+      output.className = 'reflux-setting-value';
+      output.textContent = slider.value;
+
+      slider.addEventListener('input', () => { output.textContent = slider.value; });
+      slider.addEventListener('change', () => commit(Number(slider.value)));
+      sliderRow.append(slider, output);
+      control.appendChild(sliderRow);
+    } else if (type === 'component' || type === 'custom') {
+      const host = document.createElement('div');
+      host.className = 'reflux-setting-custom';
+      const render = setting.component || setting.render;
+
+      if (typeof render === 'function') {
+        try {
+          const result = render.call(setting, {
+            value,
+            setValue: (nextValue) => commit(nextValue),
+            option: setting,
+            disabled,
+            closePluginSettings: () => {},
+          });
+
+          if (result instanceof Node) {
+            host.appendChild(result);
+          } else if (Array.isArray(result)) {
+            for (const child of result) {
+              if (child instanceof Node) host.appendChild(child);
+            }
+          } else if (result != null) {
+            const react = window.__reflux?.react;
+            if (react?.render) {
+              react.render(result, host);
+            } else {
+              const fallback = document.createElement('span');
+              fallback.className = 'reflux-setting-fallback';
+              fallback.textContent = 'This custom setting requires the React runtime.';
+              host.appendChild(fallback);
+            }
+          }
+        } catch (err) {
+          console.error(`[Reflux:SettingsUI] Custom setting "${setting.key}" threw:`, err);
+          const fallback = document.createElement('span');
+          fallback.className = 'reflux-setting-fallback';
+          fallback.textContent = 'This custom setting failed to render.';
+          host.appendChild(fallback);
+        }
+      } else {
+        const fallback = document.createElement('span');
+        fallback.className = 'reflux-setting-fallback';
+        fallback.textContent = 'No custom renderer was provided for this setting.';
+        host.appendChild(fallback);
+      }
+
+      control.appendChild(host);
+    } else {
+      const fallback = document.createElement('span');
+      fallback.className = 'reflux-setting-fallback';
+      fallback.textContent = `Unsupported setting type: ${type}`;
+      control.appendChild(fallback);
+    }
+
+    main.appendChild(control);
+    row.appendChild(main);
+    row.appendChild(error);
+    return row;
+  }
+
   // ─── Plugin card component ─────────────────────────────────────────────────
   // Built from Fluxer's own settings/switch layout and CSS variables, so it
   // follows the active Fluxer theme without depending on hashed classes.
@@ -662,7 +981,6 @@
     actions.className = 'reflux-plugin-actions';
 
     let pluginEnabled = enabled !== false;
-    const settingToggles = [];
 
     const enableToggle = makeToggle(pluginEnabled, async (on) => {
       await onToggle(on);
@@ -672,7 +990,7 @@
     function applyEnabled(on) {
       pluginEnabled = Boolean(on);
       enableToggle.setAriaLabel(`${pluginEnabled ? 'Disable' : 'Enable'} ${name}`);
-      for (const toggle of settingToggles) toggle.setDisabled(!pluginEnabled);
+      renderSettings();
     }
 
     actions.appendChild(enableToggle.el);
@@ -691,31 +1009,41 @@
     header.appendChild(actions);
     card.appendChild(header);
 
-    // Optional per-plugin settings declared in the plugin's `settings` array.
-    const visibleSettings = (settings || []).filter(s => s && s.key && s.type !== 'hidden');
-    if (visibleSettings.length) {
-      const settingsWrap = document.createElement('div');
-      settingsWrap.className = 'reflux-plugin-settings';
+    const settingSchema = Array.isArray(settings)
+      ? settings
+      : Object.entries(settings || {}).map(([key, setting]) => ({key, ...setting}));
 
-      for (const setting of visibleSettings) {
-        if (setting.type !== 'boolean') continue;
+    const settingsWrap = document.createElement('div');
+    settingsWrap.className = 'reflux-plugin-settings';
+    card.appendChild(settingsWrap);
 
-        const toggle = makeToggle(Boolean(settingValues[setting.key]), async (on) => {
-          if (!onSettingChange) return;
-          await onSettingChange(setting, on);
-        }, {
-          label:       setting.label || setting.key,
-          description: setting.description || '',
-          disabled:    !pluginEnabled,
-        });
-
-        settingToggles.push(toggle);
-        settingsWrap.appendChild(toggle.el);
-      }
-
-      if (settingsWrap.childElementCount) card.appendChild(settingsWrap);
+    async function changeSetting(setting, value) {
+      if (!onSettingChange) return;
+      const saved = await onSettingChange(setting, value);
+      settingValues[setting.key] = saved === undefined ? value : saved;
+      renderSettings();
     }
 
+    function renderSettings() {
+      settingsWrap.innerHTML = '';
+
+      for (const setting of settingSchema) {
+        if (!setting || !setting.key || setting.type === 'hidden') continue;
+        if (evaluateSettingFlag(setting.hidden, settingValues)) continue;
+
+        settingsWrap.appendChild(makeSettingRow(
+          setting,
+          settingValues[setting.key] ?? setting.default,
+          (value) => changeSetting(setting, value),
+          !pluginEnabled || evaluateSettingFlag(setting.disabled, settingValues),
+          settingValues,
+        ));
+      }
+
+      settingsWrap.style.display = settingsWrap.childElementCount ? '' : 'none';
+    }
+
+    renderSettings();
     return card;
   }
 
@@ -854,6 +1182,50 @@
     return { sec, content };
   }
 
+  async function preparePluginSettings(pluginName, mainSchema) {
+    let store = null;
+    try {
+      store = window.__reflux?.settings?.createStore?.(pluginName, mainSchema) ?? null;
+      if (store?.ready) await store.ready;
+    } catch (err) {
+      console.warn(`[Reflux:SettingsUI] Could not create settings store for "${pluginName}":`, err);
+    }
+
+    if (store) {
+      return {
+        store,
+        schema: Object.values(store.def),
+        values: {...store.plain},
+      };
+    }
+
+    const values = {};
+    for (const setting of mainSchema || []) {
+      if (!setting?.key) continue;
+      try {
+        values[setting.key] = await window.refluxBridge?.getSetting(
+          `plugins.${pluginName}.${setting.key}`,
+          setting.default,
+        );
+      } catch {
+        values[setting.key] = setting.default;
+      }
+    }
+    return {store: null, schema: mainSchema || [], values};
+  }
+
+  function makeSettingChangeHandler(pluginName, store) {
+    return async (setting, value) => {
+      if (store) return await store.set(setting.key, value);
+
+      const key = `plugins.${pluginName}.${setting.key}`;
+      await window.refluxBridge?.setSetting(key, value);
+      window.__reflux?.events?.emit?.('setting-changed', key, value);
+      window.dispatchEvent(new CustomEvent('reflux:setting-changed', {detail: {key, value}}));
+      return value;
+    };
+  }
+
   // ─── Full page builder ────────────────────────────────────────────────────
   async function buildPluginsPage(c) {
     ensureSettingsStyles();
@@ -955,18 +1327,7 @@
       } catch { /* ignore */ }
 
       for (const p of builtins) {
-        const settingValues = {};
-        for (const setting of p.settings || []) {
-          if (!setting?.key) continue;
-          try {
-            settingValues[setting.key] = await window.refluxBridge?.getSetting(
-              `plugins.${p.name}.${setting.key}`,
-              setting.default,
-            );
-          } catch {
-            settingValues[setting.key] = setting.default;
-          }
-        }
+        const {store, schema, values} = await preparePluginSettings(p.name, p.settings || []);
 
         const card = makePluginCard({
           id:          'rx-' + p.name,
@@ -975,14 +1336,9 @@
           description: p.description || '',
           badge:       'Built-in',
           enabled:     p.enabled ?? true,
-          settings:    p.settings || [],
-          settingValues,
-          onSettingChange: async (setting, value) => {
-            const key = `plugins.${p.name}.${setting.key}`;
-            await window.refluxBridge?.setSetting(key, value);
-            window.__reflux?.events?.emit?.('setting-changed', key, value);
-            window.dispatchEvent(new CustomEvent('reflux:setting-changed', {detail: {key, value}}));
-          },
+          settings:    schema,
+          settingValues: values,
+          onSettingChange: makeSettingChangeHandler(p.name, store),
           onToggle: async (on) => {
             try {
               if (on) await window.refluxBridge?.enablePlugin(p.name);
@@ -996,6 +1352,11 @@
       // Imported plugins
       const imported = await getImported();
       for (const p of imported) {
+        const importedSchema = window.__reflux?.settings?.getSchema?.(p.name) ?? [];
+        const prepared = importedSchema.length
+          ? await preparePluginSettings(p.name, importedSchema)
+          : {store: null, schema: [], values: {}};
+
         const card = makePluginCard({
           id:          'rx-imp-' + p.id,
           icon:        p.icon || null,
@@ -1005,6 +1366,9 @@
           version:     p.version || '',
           badge:       'Imported',
           enabled:     p.enabled !== false,
+          settings:    prepared.schema,
+          settingValues: prepared.values,
+          onSettingChange: makeSettingChangeHandler(p.name, prepared.store),
           onToggle: async (on) => {
             const all = await getImported();
             const t = all.find(x => x.id === p.id);

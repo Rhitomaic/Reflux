@@ -93,6 +93,81 @@ The settings schema is normalized by `definePlugin()`. Supported option types
 in the core API are `OptionType.STRING`, `NUMBER`, `BOOLEAN`, `SELECT`,
 `SLIDER`, `COMPONENT`, and `CUSTOM`.
 
+```js
+settings: {
+  displayName: {
+    type: OptionType.STRING,
+    description: 'Text shown next to your messages.',
+    placeholder: 'Anonymous',
+    default: '',
+  },
+  messageLimit: {
+    type: OptionType.NUMBER,
+    description: 'How many messages to keep per channel.',
+    min: 10,
+    max: 1000,
+    step: 10,
+    default: 250,
+  },
+  mode: {
+    type: OptionType.SELECT,
+    description: 'How messages are displayed.',
+    options: [
+      {label: 'Compact', value: 'compact'},
+      {label: 'Detailed', value: 'detailed', default: true},
+    ],
+  },
+  opacity: {
+    type: OptionType.SLIDER,
+    description: 'Overlay opacity.',
+    markers: [0, 25, 50, 75, 100],
+    default: 75,
+  },
+  customHeader: {
+    type: OptionType.COMPONENT,
+    description: 'A custom control rendered by the plugin.',
+    component({value, setValue, disabled}) {
+      // Renderer-side only: return a DOM node or React element.
+      const button = document.createElement('button');
+      button.textContent = value ? 'On' : 'Off';
+      button.disabled = disabled;
+      button.onclick = () => setValue(!value);
+      return button;
+    },
+  },
+}
+```
+
+| Field | Applies to | Description |
+|---|---|---|
+| `label` / `displayName` | all | Row label. Defaults to a humanized key. |
+| `description` | all | Helper text below the label. |
+| `default` | all | Initial value. Selects default to their `default: true` option. |
+| `options` | select | `string[]` or `{label, value, default?}[]`. |
+| `markers` | slider | Allowed marker values; also determines the range. |
+| `stickToMarkers` | slider | Snap saved values to the nearest marker. |
+| `multiline` | string | Render a textarea instead of a single-line input. |
+| `placeholder` | string | Input placeholder. |
+| `min` / `max` / `step` | number | Native number input constraints. |
+| `hidden` | all | Boolean or function; hides the row. |
+| `disabled` | all | Boolean or function; disables the control. |
+| `isValid(value)` | all | Return `true`, `false`, or a custom error string. |
+| `onChange(value)` | all | Called after a value changes. |
+| `component` / `render` | component/custom | Renderer-side custom control factory. |
+| `restartNeeded` | all | Show that a Fluxer restart is required after changing it. |
+
+`hidden`, `disabled`, and `isValid` functions receive the current settings
+object as `this`:
+
+```js
+{
+  type: OptionType.BOOLEAN,
+  description: 'Only applies in detailed mode.',
+  hidden() { return this.mode !== 'detailed'; },
+  default: true,
+}
+```
+
 `definePlugin()` attaches a main-process settings store before `start()`:
 
 ```js
